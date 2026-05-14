@@ -113,11 +113,22 @@ By default, sqlcsv expects a header row, comma delimiter, double-quote quoting, 
 
 - `--no-header` — file has no header; columns are named `col1`, `col2`, ...
 - `--delim CHAR` — single-character delimiter other than `,` (use `\t` for tab)
-- `--quote CHAR` — single-character quote character other than `"`
+
+A UTF-8 byte-order mark (BOM) at the start of the file — common in Excel's "Save as CSV UTF-8" output — is stripped automatically; the first column name is not prefixed with it. CRLF and LF line endings are both accepted. Fields containing the delimiter, embedded quotes, or embedded newlines work as long as they are properly double-quoted per RFC 4180.
+
+sqlcsv parses with `LazyQuotes = true`, which is forgiving about bare quotes mid-field and unbalanced quotes — usually a good thing for messy real-world files, but it can mask data corruption in a CSV that was truncated mid-export. A row count that does not match what you expect is the symptom.
+
+Headers are trimmed of leading and trailing whitespace; the load fails clearly if a header is empty or duplicates another header, since both quietly corrupt schema lookups.
 
 ### Type inference
 
 sqlcsv samples the first 1024 rows and infers a type per column: `int`, `float`, `bool`, `date`, or `string`. Comparisons use the inferred type, so `Priority > 2` does numeric compare and `Modified < '2024-01-01'` does date compare. The `describe` command shows what was inferred. Override at startup with `--type Name=string,Priority=int` if inference picks wrong.
+
+A few inference behaviors are worth knowing:
+
+- **Leading-zero values stay strings.** `"07030"`, `"007"`, `"-01"` look numeric to `strconv` but are almost always identifiers (ZIP codes, employee numbers, phone extensions). Inferring them as `int` would silently drop the leading zero on the next write, so the column infers as `string`. Pass `--type Code=int` to override.
+- **`NaN` and `Inf` are not treated as numeric.** Excel's `#DIV/0!`-as-`NaN` cells leak through `strconv.ParseFloat`, but `NaN` breaks SQL equality (NaN ≠ NaN) and pollutes round-trips, so the column falls back to `string` whenever they appear.
+- **Scientific notation in the data still infers as `float`.** If you have integer IDs that Excel rendered as `1.23E+12`, the round-trip will not restore the original integer string. Pin the column with `--type ID=string` to preserve the literal text.
 
 ## SQL subset
 

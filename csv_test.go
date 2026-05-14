@@ -25,6 +25,12 @@ func TestInferColumn(t *testing.T) {
 		{"all empty defaults to string", [][]string{{""}, {""}}, TypeString},
 		{"single non-int kills int inference", [][]string{{"1"}, {"2"}, {"abc"}}, TypeString},
 		{"0/1 stay as int, not bool", [][]string{{"0"}, {"1"}, {"0"}}, TypeInt},
+		{"leading-zero ZIP codes stay as string", [][]string{{"07030"}, {"10001"}, {"02101"}}, TypeString},
+		{"single leading-zero entry knocks column out of int", [][]string{{"1"}, {"2"}, {"007"}}, TypeString},
+		{"NaN keeps column out of float", [][]string{{"1.5"}, {"2.5"}, {"NaN"}}, TypeString},
+		{"Infinity keeps column out of float", [][]string{{"1.5"}, {"Inf"}}, TypeString},
+		{"signed leading zero is rejected", [][]string{{"-01"}, {"-02"}}, TypeString},
+		{"plain zero is fine", [][]string{{"0"}, {"5"}, {"-7"}}, TypeInt},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -283,6 +289,105 @@ func TestLoadTypeHintOverride(t *testing.T) {
 	if tbl.Rows[0][1].Str != "001" {
 		t.Errorf("Code should preserve leading zeros, got %q", tbl.Rows[0][1].Str)
 	}
+}
+
+// TestLoadStripsUTF8BOM exercises the BOM peek-and-skip path. Excel's
+// "Save as CSV UTF-8" writes one and would otherwise corrupt the first
+// column header.
+func TestLoadStripsUTF8BOM(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "bom.csv")
+	content := "\xef\xbb\xbfID,Name\n1,Alpha\n2,Beta\n"
+	if err := os.WriteFile(src, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := LoadCSV(src, LoadOptions{})
+	if err != nil {
+		t.Fatalf("LoadCSV: %v", err)
+	}
+	if tbl.Columns[0] != "ID" {
+		t.Fatalf("first column = %q, want %q (BOM not stripped)", tbl.Columns[0], "ID")
+	}
+	if _, ok := tbl.Schema["ID"]; !ok {
+		t.Fatalf("Schema lookup for ID failed; keys: %v", keysOf(tbl.Schema))
+	}
+}
+
+// TestLoadAutoDetectsLeadingZeros verifies the inference rule that pulls
+// columns with leading-zero values out of TypeInt without needing a
+// --type override.
+func TestLoadAutoDetectsLeadingZeros(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "zip.csv")
+	content := "Name,Zip\nAlice,07030\nBob,10001\nCarol,02101\n"
+	if err := os.WriteFile(src, []byte(content), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := LoadCSV(src, LoadOptions{})
+	if err != nil {
+		t.Fatalf("LoadCSV: %v", err)
+	}
+	if got := tbl.Schema["Zip"].Type; got != TypeString {
+		t.Fatalf("Zip type: got %v, want string", got)
+	}
+	if tbl.Rows[0][1].Str != "07030" {
+		t.Errorf("Zip cell: got %q, want %q (leading zero lost)", tbl.Rows[0][1].Str, "07030")
+	}
+}
+
+func TestLoadRejectsDuplicateHeaders(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "dup.csv")
+	if err := os.WriteFile(src, []byte("ID,Amount,Amount\n1,10,20\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadCSV(src, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error for duplicate header")
+	}
+	if !strings.Contains(err.Error(), "duplicate") && !strings.Contains(err.Error(), "Amount") {
+		t.Fatalf("error should name the duplicate: %v", err)
+	}
+}
+
+func TestLoadRejectsEmptyHeader(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "empty.csv")
+	if err := os.WriteFile(src, []byte("ID, ,Name\n1, ,Alpha\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := LoadCSV(src, LoadOptions{})
+	if err == nil {
+		t.Fatal("expected error for empty/whitespace header")
+	}
+	if !strings.Contains(err.Error(), "empty") {
+		t.Fatalf("error should mention empty: %v", err)
+	}
+}
+
+// TestLoadTrimsHeaderWhitespace: a CSV with " Name " in the header should
+// load successfully and the column should be addressable as "Name".
+func TestLoadTrimsHeaderWhitespace(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "trim.csv")
+	if err := os.WriteFile(src, []byte(" ID , Name \n1,Alpha\n"), 0644); err != nil {
+		t.Fatal(err)
+	}
+	tbl, err := LoadCSV(src, LoadOptions{})
+	if err != nil {
+		t.Fatalf("LoadCSV: %v", err)
+	}
+	if tbl.Columns[0] != "ID" || tbl.Columns[1] != "Name" {
+		t.Fatalf("columns: %v, want [ID Name]", tbl.Columns)
+	}
+}
+
+func keysOf(m map[string]ColumnInfo) []string {
+	out := make([]string, 0, len(m))
+	for k := range m {
+		out = append(out, k)
+	}
+	return out
 }
 
 func TestParseColumnType(t *testing.T) {
