@@ -5,7 +5,7 @@ A SQL REPL for CSV files. Bind to a single CSV at startup, then run SELECT, UPDA
 ## Example
 
 ```
-$ sqlcsv --csv tasks.csv
+$ sqlcsv tasks.csv
 Connected to: tasks.csv (5 columns, 248 rows)
 sqlcsv REPL — type "help" for commands, "quit" to exit.
 
@@ -48,7 +48,7 @@ Requires Go 1.24 or later.
 ### Interactive REPL
 
 ```
-sqlcsv --csv <path>
+sqlcsv <path>
 ```
 
 Opens a prompt bound to the file. Arrow keys recall history, Ctrl-R searches it, Ctrl-D exits. History persists at `~/.config/sqlcsv/history` across sessions.
@@ -66,7 +66,7 @@ When a write is applied, sqlcsv rewrites the bound file. Pass `--output FILE` at
 ### One-shot mode
 
 ```
-sqlcsv --csv <path> --exec "<sql>"
+sqlcsv <path> --exec "<sql>"
 ```
 
 Runs one statement and exits. Writes need `--commit`; a bare DELETE (no WHERE clause) additionally needs `--confirm-destructive`. Output auto-detects to ASCII table on an interactive terminal and TSV when piped. Override with `--format=json` for JSON, useful for scripts that consume the results.

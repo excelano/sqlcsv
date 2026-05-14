@@ -7,8 +7,45 @@ import (
 	"strings"
 )
 
+// reorderArgs moves positional arguments to the end of args so Go's flag
+// package (which stops parsing at the first non-flag token) can see all
+// flags regardless of where they appear on the command line. The set of
+// boolean flags — which don't consume the next token — is discovered from
+// the flag package itself, so adding a new flag in `var (...)` doesn't
+// also require an edit here.
+func reorderArgs(args []string) []string {
+	boolFlag := map[string]bool{}
+	flag.VisitAll(func(f *flag.Flag) {
+		if bf, ok := f.Value.(interface{ IsBoolFlag() bool }); ok && bf.IsBoolFlag() {
+			boolFlag[f.Name] = true
+		}
+	})
+
+	var flags, positional []string
+	for i := 0; i < len(args); i++ {
+		a := args[i]
+		if !strings.HasPrefix(a, "-") || a == "-" {
+			positional = append(positional, a)
+			continue
+		}
+		if a == "--" {
+			positional = append(positional, args[i+1:]...)
+			break
+		}
+		flags = append(flags, a)
+		name := strings.TrimLeft(a, "-")
+		if strings.ContainsRune(name, '=') {
+			continue
+		}
+		if !boolFlag[name] && i+1 < len(args) {
+			flags = append(flags, args[i+1])
+			i++
+		}
+	}
+	return append(flags, positional...)
+}
+
 var (
-	flagCSV      = flag.String("csv", "", "CSV file path (required)")
 	flagExec     = flag.String("exec", "", "Run one SQL statement and exit (non-REPL mode)")
 	flagFormat   = flag.String("format", "", "Output format: table | tsv | json (auto-detected if blank)")
 	flagCommit   = flag.Bool("commit", false, "Commit writes in --exec mode (required for INSERT/UPDATE/DELETE)")
@@ -20,11 +57,22 @@ var (
 )
 
 func main() {
-	flag.Parse()
+	flag.Usage = func() {
+		fmt.Fprintln(os.Stderr, "Usage: sqlcsv [flags] <csv-file>")
+		fmt.Fprintln(os.Stderr)
+		fmt.Fprintln(os.Stderr, "Flags:")
+		flag.PrintDefaults()
+	}
+	flag.CommandLine.Parse(reorderArgs(os.Args[1:]))
 
-	if *flagCSV == "" {
-		fmt.Fprintln(os.Stderr, "Error: --csv is required")
+	csvPath := flag.Arg(0)
+	if csvPath == "" {
+		fmt.Fprintln(os.Stderr, "Error: CSV file path is required")
 		flag.Usage()
+		os.Exit(2)
+	}
+	if flag.NArg() > 1 {
+		fmt.Fprintf(os.Stderr, "Error: unexpected extra arguments after %q: %v\n", csvPath, flag.Args()[1:])
 		os.Exit(2)
 	}
 
@@ -40,7 +88,7 @@ func main() {
 		os.Exit(2)
 	}
 
-	t, err := LoadCSV(*flagCSV, LoadOptions{
+	t, err := LoadCSV(csvPath, LoadOptions{
 		Delim:     delim,
 		NoHeader:  *flagNoHeader,
 		TypeHints: hints,
