@@ -61,6 +61,18 @@ From source (Go 1.24 or later):
 go install github.com/excelano/sqlcsv@latest
 ```
 
+### Upgrade
+
+Re-run the installer. If sqlcsv is already on your `PATH`, it upgrades the existing copy in place rather than scattering a duplicate into the default directory. If you explicitly set `SQLCSV_INSTALL_DIR` to a different directory than the existing copy, the installer warns and leaves both in place — `PATH` order then decides which version runs.
+
+### Uninstall
+
+```
+curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/uninstall.sh | sh
+```
+
+The uninstaller removes the `sqlcsv` binary it finds on `PATH` and asks before removing `~/.config/sqlcsv/` (REPL history). Run twice if you have duplicate installs in multiple directories. Skip the prompts with `SQLCSV_UNINSTALL_YES=1`; also drop the config dir with `SQLCSV_PURGE=1`.
+
 ## Usage
 
 ### Interactive REPL

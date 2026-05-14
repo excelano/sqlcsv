@@ -58,9 +58,23 @@ resolve_version() {
 	say "Installing sqlcsv $VERSION (latest)"
 }
 
+detect_existing() {
+	EXISTING_PATH=""
+	EXISTING_DIR=""
+	if command -v sqlcsv >/dev/null 2>&1; then
+		EXISTING_PATH=$(command -v sqlcsv)
+		EXISTING_DIR=$(dirname "$EXISTING_PATH")
+	fi
+}
+
 pick_install_dir() {
 	if [ -n "${SQLCSV_INSTALL_DIR:-}" ]; then
 		INSTALL_DIR="$SQLCSV_INSTALL_DIR"
+	elif [ -n "$EXISTING_DIR" ]; then
+		# An existing install wins over the default — upgrade in place rather
+		# than scattering a second copy into a directory earlier on PATH.
+		INSTALL_DIR="$EXISTING_DIR"
+		say "Existing install at $EXISTING_PATH — upgrading in place"
 	elif [ -w /usr/local/bin ] 2>/dev/null; then
 		INSTALL_DIR=/usr/local/bin
 	else
@@ -68,6 +82,19 @@ pick_install_dir() {
 		INSTALL_DIR="$HOME/.local/bin"
 	fi
 	mkdir -p "$INSTALL_DIR" || err "cannot create install dir $INSTALL_DIR"
+	if [ ! -w "$INSTALL_DIR" ]; then
+		if [ -n "$EXISTING_DIR" ] && [ "$EXISTING_DIR" = "$INSTALL_DIR" ]; then
+			err "existing install at $EXISTING_PATH is not writable; re-run with sudo to upgrade"
+		fi
+		err "$INSTALL_DIR is not writable; set SQLCSV_INSTALL_DIR or re-run with sudo"
+	fi
+	if [ -n "$EXISTING_DIR" ] && [ "$EXISTING_DIR" != "$INSTALL_DIR" ]; then
+		say "Warning: sqlcsv already installed at $EXISTING_PATH"
+		say "         New copy will land at $INSTALL_DIR/sqlcsv"
+		say "         You will have two copies; PATH order decides which runs"
+		say "         To remove the other one: sqlcsv uninstaller at"
+		say "         https://raw.githubusercontent.com/excelano/sqlcsv/main/uninstall.sh"
+	fi
 }
 
 download_and_install() {
@@ -128,6 +155,7 @@ post_install_message() {
 }
 
 detect_platform
+detect_existing
 resolve_version
 pick_install_dir
 download_and_install

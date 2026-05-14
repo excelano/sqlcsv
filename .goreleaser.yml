@@ -49,6 +49,7 @@ release:
   # specific release URL instead of relying on the rolling main branch.
   extra_files:
     - glob: install.sh
+    - glob: uninstall.sh
 
 changelog:
   sort: asc
