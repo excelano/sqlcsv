@@ -1,0 +1,57 @@
+# goreleaser configuration. Triggered by .github/workflows/release.yml on
+# every "v*" tag push. To test locally (optional):
+#   goreleaser release --snapshot --clean
+# Snapshots produce binaries in ./dist/ without touching GitHub.
+
+version: 2
+
+before:
+  hooks:
+    - go mod tidy
+
+builds:
+  - id: sqlcsv
+    main: .
+    binary: sqlcsv
+    env:
+      - CGO_ENABLED=0
+    goos:
+      - linux
+      - darwin
+      - windows
+    goarch:
+      - amd64
+      - arm64
+    ignore:
+      - goos: windows
+        goarch: arm64
+    ldflags:
+      - -s -w
+
+archives:
+  - id: sqlcsv
+    name_template: "sqlcsv_{{ .Version }}_{{ .Os }}_{{ .Arch }}"
+    format_overrides:
+      - goos: windows
+        formats: ["zip"]
+    files:
+      - LICENSE
+      - README.md
+      - GRAMMAR.md
+
+checksum:
+  name_template: "checksums.txt"
+
+release:
+  draft: false
+  prerelease: auto
+
+changelog:
+  sort: asc
+  use: github
+  filters:
+    exclude:
+      - "^docs:"
+      - "^test:"
+      - "^ci:"
+      - "Merge pull request"
