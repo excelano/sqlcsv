@@ -43,6 +43,12 @@ Prebuilt binary (Linux and macOS, x86_64 and arm64):
 curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sh
 ```
 
+If the installer needs to write to a root-owned directory like `/usr/local/bin` (typical when upgrading a previously sudo-installed copy), wrap `sh`, not `curl`:
+
+```
+curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sudo sh
+```
+
 Pin to a specific version:
 
 ```

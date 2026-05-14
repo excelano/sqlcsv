@@ -48,10 +48,14 @@ resolve_version() {
 		say "Installing sqlcsv $VERSION (pinned via SQLCSV_VERSION)"
 		return
 	fi
-	# Resolve the latest tag without a token: the redirect on /releases/latest
-	# exposes it in the Location header.
-	VERSION=$(curl -fsSI "https://github.com/${REPO}/releases/latest" \
-		| awk -F'/' '/^[Ll]ocation:/ { sub(/\r$/, "", $NF); print $NF; exit }')
+	# Resolve the latest tag via the GitHub API. The web /releases/latest
+	# redirect is cached at GitHub's edge for several minutes after a new
+	# release, which made re-running this script right after a tag silently
+	# install the previous version. The API is real-time. Anonymous calls
+	# are rate-limited to 60/hour per IP, which is fine for a human-run
+	# installer.
+	VERSION=$(curl -fsSL "https://api.github.com/repos/${REPO}/releases/latest" \
+		| awk -F'"' '/"tag_name":/ { print $4; exit }')
 	if [ -z "${VERSION:-}" ]; then
 		err "could not resolve latest release tag from GitHub"
 	fi
@@ -82,11 +86,18 @@ pick_install_dir() {
 		INSTALL_DIR="$HOME/.local/bin"
 	fi
 	mkdir -p "$INSTALL_DIR" || err "cannot create install dir $INSTALL_DIR"
+	# Many users land here because they tried `sudo curl ... | sh`, which only
+	# sudoes curl, not the sh that's writing the binary. Give them the literal
+	# correct command (sudo wraps sh, not curl) so they don't have to figure
+	# out which side of the pipe needs the privilege.
 	if [ ! -w "$INSTALL_DIR" ]; then
 		if [ -n "$EXISTING_DIR" ] && [ "$EXISTING_DIR" = "$INSTALL_DIR" ]; then
-			err "existing install at $EXISTING_PATH is not writable; re-run with sudo to upgrade"
+			err "existing install at $EXISTING_PATH is not writable; re-run as
+       curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo sh"
 		fi
-		err "$INSTALL_DIR is not writable; set SQLCSV_INSTALL_DIR or re-run with sudo"
+		err "$INSTALL_DIR is not writable; either set SQLCSV_INSTALL_DIR to a
+       writable directory, or re-run as
+       curl -fsSL https://raw.githubusercontent.com/${REPO}/main/install.sh | sudo sh"
 	fi
 	if [ -n "$EXISTING_DIR" ] && [ "$EXISTING_DIR" != "$INSTALL_DIR" ]; then
 		say "Warning: sqlcsv already installed at $EXISTING_PATH"
