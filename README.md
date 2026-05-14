@@ -37,11 +37,29 @@ It is a sibling to [spsql](https://github.com/excelano/spsql), which does the sa
 
 ## Install
 
+Prebuilt binary (Linux and macOS, x86_64 and arm64):
+
+```
+curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sh
+```
+
+Pin to a specific version:
+
+```
+SQLCSV_VERSION=v0.1.1 curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sh
+```
+
+Install elsewhere than `/usr/local/bin` (or `~/.local/bin` if not writable):
+
+```
+SQLCSV_INSTALL_DIR=$HOME/bin curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sh
+```
+
+From source (Go 1.24 or later):
+
 ```
 go install github.com/excelano/sqlcsv@latest
 ```
-
-Requires Go 1.24 or later.
 
 ## Usage
 
