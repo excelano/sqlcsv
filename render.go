@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"strings"
+
+	"github.com/mattn/go-runewidth"
 )
 
 // FormatTable, FormatTSV, FormatJSON are the supported --format values.
@@ -76,7 +78,7 @@ func renderTable(out io.Writer, r Result) error {
 func writeTableBody(out io.Writer, cols []string, rows []map[string]any) error {
 	widths := make([]int, len(cols))
 	for i, c := range cols {
-		widths[i] = len(c)
+		widths[i] = runewidth.StringWidth(c)
 	}
 	cells := make([][]string, len(rows))
 	for ri, row := range rows {
@@ -84,8 +86,8 @@ func writeTableBody(out io.Writer, cols []string, rows []map[string]any) error {
 		for ci, c := range cols {
 			s := stringify(row[c])
 			cells[ri][ci] = s
-			if len(s) > widths[ci] {
-				widths[ci] = len(s)
+			if w := runewidth.StringWidth(s); w > widths[ci] {
+				widths[ci] = w
 			}
 		}
 	}
@@ -169,11 +171,15 @@ func stringify(v any) string {
 	return fmt.Sprintf("%v", v)
 }
 
+// padRight pads s to a target display width w, using runewidth so that
+// multi-byte and East Asian wide characters land in the column count they
+// actually occupy on a terminal — not the number of bytes they take up.
 func padRight(s string, w int) string {
-	if len(s) >= w {
+	sw := runewidth.StringWidth(s)
+	if sw >= w {
 		return s
 	}
-	return s + strings.Repeat(" ", w-len(s))
+	return s + strings.Repeat(" ", w-sw)
 }
 
 func plural(n int) string {
