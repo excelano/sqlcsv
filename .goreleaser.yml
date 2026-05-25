@@ -39,6 +39,31 @@ archives:
       - README.md
       - GRAMMAR.md
 
+nfpms:
+  - id: sqlcsv
+    package_name: sqlcsv
+    file_name_template: "{{ .ConventionalFileName }}"
+    maintainer: David M. Anderson <david.anderson@excelano.com>
+    description: |
+      SQL REPL for CSV files. Sibling to spsql.
+      In-memory edits with type inference, dry-run writes, and a parser
+      shared with spsql. Same SQL subset (SELECT/UPDATE/DELETE/INSERT)
+      against the bound CSV file.
+    homepage: https://github.com/excelano/sqlcsv
+    license: MIT
+    formats:
+      - deb
+    section: database
+    priority: optional
+    bindir: /usr/bin
+    contents:
+      - src: ./LICENSE
+        dst: /usr/share/doc/sqlcsv/copyright
+      - src: ./README.md
+        dst: /usr/share/doc/sqlcsv/README.md
+      - src: ./GRAMMAR.md
+        dst: /usr/share/doc/sqlcsv/GRAMMAR.md
+
 checksum:
   name_template: "checksums.txt"
 
