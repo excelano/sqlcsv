@@ -61,6 +61,13 @@ Install elsewhere than `/usr/local/bin` (or `~/.local/bin` if not writable):
 SQLCSV_INSTALL_DIR=$HOME/bin curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/install.sh | sh
 ```
 
+On Debian or Ubuntu, install from the [Excelano apt repository](https://excelano.com/apt/) instead, so `apt upgrade` keeps it current:
+
+```sh
+curl -fsSL https://excelano.com/apt/setup.sh | sudo sh
+sudo apt install sqlcsv
+```
+
 From source (Go 1.24 or later):
 
 ```
