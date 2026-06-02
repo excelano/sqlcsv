@@ -6,12 +6,17 @@ import (
 	"testing"
 )
 
-func vstr(s string) Value  { return Value{Kind: ValString, Str: s} }
-func vnum(n string) Value  { return Value{Kind: ValNumber, Num: n} }
-func vbool(b bool) Value   { return Value{Kind: ValBool, Bool: b} }
-func vnull() Value         { return Value{Kind: ValNull} }
-func cmp(c, op string, v Value) *Comparison { return &Comparison{Column: c, Op: op, Value: v} }
-func isnull(c string, not bool) *NullTest    { return &NullTest{Column: c, Not: not} }
+func vstr(s string) Value { return Value{Kind: ValString, Str: s} }
+func vnum(n string) Value { return Value{Kind: ValNumber, Num: n} }
+func vbool(b bool) Value  { return Value{Kind: ValBool, Bool: b} }
+func vnull() Value        { return Value{Kind: ValNull} }
+func cmp(c, op string, v Value) *Comparison {
+	return &Comparison{LExpr: &ColumnExpr{Name: c}, Op: op, Value: v}
+}
+func cmpE(lhs Expr, op string, v Value) *Comparison {
+	return &Comparison{LExpr: lhs, Op: op, Value: v}
+}
+func isnull(c string, not bool) *NullTest   { return &NullTest{Column: c, Not: not} }
 func and(l, r Predicate) *BinaryOp          { return &BinaryOp{Op: "AND", L: l, R: r} }
 func or(l, r Predicate) *BinaryOp           { return &BinaryOp{Op: "OR", L: l, R: r} }
 func not(p Predicate) *NotOp                { return &NotOp{Inner: p} }
@@ -24,6 +29,22 @@ func in(c string, vs []Value, n bool) *InOp { return &InOp{Column: c, Values: vs
 func between(c string, lo, hi Value, n bool) *BetweenOp {
 	return &BetweenOp{Column: c, Low: lo, High: hi, Not: n}
 }
+
+// v2 expression helpers.
+func cols(names ...string) []Projection {
+	ps := make([]Projection, len(names))
+	for i, n := range names {
+		ps[i] = Projection{Expr: &ColumnExpr{Name: n}}
+	}
+	return ps
+}
+func colE(name string) Expr                  { return &ColumnExpr{Name: name} }
+func litE(v Value) Expr                      { return &LiteralExpr{Value: v} }
+func binE(op string, l, r Expr) Expr         { return &BinaryExpr{Op: op, L: l, R: r} }
+func aggE(fn string, arg Expr) Expr          { return &AggregateExpr{Func: fn, Arg: arg} }
+func aggStar() Expr                          { return &AggregateExpr{Func: "COUNT", Star: true} }
+func proj(e Expr) Projection                 { return Projection{Expr: e} }
+func projAs(e Expr, alias string) Projection { return Projection{Expr: e, Alias: alias} }
 
 func TestParse(t *testing.T) {
 	tests := []struct {
@@ -46,22 +67,22 @@ func TestParse(t *testing.T) {
 		{
 			name:  "select single column",
 			input: "SELECT Title",
-			want:  &SelectStmt{Columns: []string{"Title"}},
+			want:  &SelectStmt{Columns: cols("Title")},
 		},
 		{
 			name:  "select multiple columns",
 			input: "SELECT Title, Status, Priority",
-			want:  &SelectStmt{Columns: []string{"Title", "Status", "Priority"}},
+			want:  &SelectStmt{Columns: cols("Title", "Status", "Priority")},
 		},
 		{
 			name:  "select with quoted identifier",
 			input: `SELECT Title, "Created Date"`,
-			want:  &SelectStmt{Columns: []string{"Title", "Created Date"}},
+			want:  &SelectStmt{Columns: cols("Title", "Created Date")},
 		},
 		{
 			name:  "select with escaped quote in identifier",
 			input: `SELECT "He said ""hi"""`,
-			want:  &SelectStmt{Columns: []string{`He said "hi"`}},
+			want:  &SelectStmt{Columns: cols(`He said "hi"`)},
 		},
 
 		// DISTINCT
@@ -73,24 +94,24 @@ func TestParse(t *testing.T) {
 		{
 			name:  "select distinct single column",
 			input: "SELECT DISTINCT Status",
-			want:  &SelectStmt{Distinct: true, Columns: []string{"Status"}},
+			want:  &SelectStmt{Distinct: true, Columns: cols("Status")},
 		},
 		{
 			name:  "select distinct multiple columns",
 			input: "SELECT DISTINCT Status, Priority",
-			want:  &SelectStmt{Distinct: true, Columns: []string{"Status", "Priority"}},
+			want:  &SelectStmt{Distinct: true, Columns: cols("Status", "Priority")},
 		},
 		{
 			name:  "select distinct lowercase",
 			input: "select distinct status",
-			want:  &SelectStmt{Distinct: true, Columns: []string{"status"}},
+			want:  &SelectStmt{Distinct: true, Columns: cols("status")},
 		},
 		{
 			name:  "select distinct with where",
 			input: "SELECT DISTINCT Status WHERE Priority > 2",
 			want: &SelectStmt{
 				Distinct: true,
-				Columns:  []string{"Status"},
+				Columns: cols("Status"),
 				Where:    cmp("Priority", ">", vnum("2")),
 			},
 		},
@@ -141,7 +162,7 @@ func TestParse(t *testing.T) {
 			input: "SELECT DISTINCT Status WHERE Priority > 2 ORDER BY Status DESC LIMIT 3 OFFSET 1",
 			want: &SelectStmt{
 				Distinct: true,
-				Columns:  []string{"Status"},
+				Columns: cols("Status"),
 				Where:    cmp("Priority", ">", vnum("2")),
 				OrderBy:  []OrderKey{desc("Status")},
 				Limit:    iptr(3),
@@ -319,32 +340,32 @@ func TestParse(t *testing.T) {
 		{
 			name:  "select where equals",
 			input: "SELECT Title WHERE Status = 'Open'",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Status", "=", vstr("Open"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Status", "=", vstr("Open"))},
 		},
 		{
 			name:  "select where not equals",
 			input: "SELECT Title WHERE Status != 'Open'",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Status", "!=", vstr("Open"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Status", "!=", vstr("Open"))},
 		},
 		{
 			name:  "select where less than",
 			input: "SELECT Title WHERE Priority < 3",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Priority", "<", vnum("3"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Priority", "<", vnum("3"))},
 		},
 		{
 			name:  "select where less or equal",
 			input: "SELECT Title WHERE Priority <= 3",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Priority", "<=", vnum("3"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Priority", "<=", vnum("3"))},
 		},
 		{
 			name:  "select where greater than",
 			input: "SELECT Title WHERE Priority > 3",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Priority", ">", vnum("3"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Priority", ">", vnum("3"))},
 		},
 		{
 			name:  "select where greater or equal",
 			input: "SELECT Title WHERE Priority >= 3",
-			want:  &SelectStmt{Columns: []string{"Title"}, Where: cmp("Priority", ">=", vnum("3"))},
+			want:  &SelectStmt{Columns: cols("Title"), Where: cmp("Priority", ">=", vnum("3"))},
 		},
 
 		// Value kinds
@@ -424,7 +445,7 @@ func TestParse(t *testing.T) {
 			name:  "update single assignment",
 			input: "UPDATE SET Status = 'Done'",
 			want: &UpdateStmt{
-				Assignments: []Assignment{{Column: "Status", Value: vstr("Done")}},
+				Assignments: []Assignment{{Column: "Status", Value: litE(vstr("Done"))}},
 			},
 		},
 		{
@@ -432,8 +453,8 @@ func TestParse(t *testing.T) {
 			input: "UPDATE SET Status = 'Done', Priority = 1 WHERE ID = 42",
 			want: &UpdateStmt{
 				Assignments: []Assignment{
-					{Column: "Status", Value: vstr("Done")},
-					{Column: "Priority", Value: vnum("1")},
+					{Column: "Status", Value: litE(vstr("Done"))},
+					{Column: "Priority", Value: litE(vnum("1"))},
 				},
 				Where: cmp("ID", "=", vnum("42")),
 			},
@@ -482,7 +503,7 @@ func TestParse(t *testing.T) {
 			name:  "mixed case keywords",
 			input: "Select Title Where Status = 'Open' And Priority > 2",
 			want: &SelectStmt{
-				Columns: []string{"Title"},
+				Columns: cols("Title"),
 				Where:   and(cmp("Status", "=", vstr("Open")), cmp("Priority", ">", vnum("2"))),
 			},
 		},
@@ -492,7 +513,7 @@ func TestParse(t *testing.T) {
 			name:  "whitespace tolerant",
 			input: "  SELECT   Title   WHERE   Status='Open'  ",
 			want: &SelectStmt{
-				Columns: []string{"Title"},
+				Columns: cols("Title"),
 				Where:   cmp("Status", "=", vstr("Open")),
 			},
 		},
@@ -506,7 +527,7 @@ func TestParse(t *testing.T) {
 		{
 			name:    "select with no projection",
 			input:   "SELECT",
-			wantErr: "expected column name",
+			wantErr: "expected expression",
 		},
 		{
 			name:    "select with from",
@@ -516,12 +537,12 @@ func TestParse(t *testing.T) {
 		{
 			name:    "select with trailing comma",
 			input:   "SELECT Title,",
-			wantErr: "expected column name",
+			wantErr: "expected expression",
 		},
 		{
 			name:    "where with no predicate",
 			input:   "SELECT * WHERE",
-			wantErr: "expected column name",
+			wantErr: "expected expression",
 		},
 		{
 			name:    "comparison missing value",
@@ -596,12 +617,224 @@ func TestParse(t *testing.T) {
 		{
 			name:    "negative without digit",
 			input:   "SELECT * WHERE A = -",
-			wantErr: "expected digit after '-'",
+			wantErr: "expected number after '-'",
 		},
 		{
 			name:    "decimal without digit",
 			input:   "SELECT * WHERE A = 1.",
 			wantErr: "expected digit after '.'",
+		},
+
+		// v2: AS alias
+		{
+			name:  "select column with alias",
+			input: "SELECT Title AS t",
+			want:  &SelectStmt{Columns: []Projection{projAs(colE("Title"), "t")}},
+		},
+		{
+			name:  "select multiple aliased columns",
+			input: "SELECT Title AS t, Status AS s",
+			want: &SelectStmt{Columns: []Projection{
+				projAs(colE("Title"), "t"),
+				projAs(colE("Status"), "s"),
+			}},
+		},
+		{
+			name:  "select mixed aliased and bare",
+			input: "SELECT Title AS t, Status",
+			want: &SelectStmt{Columns: []Projection{
+				projAs(colE("Title"), "t"),
+				proj(colE("Status")),
+			}},
+		},
+		{
+			name:    "alias requires identifier",
+			input:   "SELECT Title AS 42",
+			wantErr: "alias name",
+		},
+
+		// v2: arithmetic in projections
+		{
+			name:  "select arithmetic add",
+			input: "SELECT price + tax",
+			want: &SelectStmt{Columns: []Projection{
+				proj(binE("+", colE("price"), colE("tax"))),
+			}},
+		},
+		{
+			name:  "select arithmetic multiply",
+			input: "SELECT price * qty",
+			want: &SelectStmt{Columns: []Projection{
+				proj(binE("*", colE("price"), colE("qty"))),
+			}},
+		},
+		{
+			name:  "select arithmetic precedence",
+			input: "SELECT a + b * c",
+			want: &SelectStmt{Columns: []Projection{
+				proj(binE("+", colE("a"), binE("*", colE("b"), colE("c")))),
+			}},
+		},
+		{
+			name:  "select arithmetic parens override precedence",
+			input: "SELECT (a + b) * c",
+			want: &SelectStmt{Columns: []Projection{
+				proj(binE("*", binE("+", colE("a"), colE("b")), colE("c"))),
+			}},
+		},
+		{
+			name:  "select arithmetic with literal",
+			input: "SELECT price * 2 AS doubled",
+			want: &SelectStmt{Columns: []Projection{
+				projAs(binE("*", colE("price"), litE(vnum("2"))), "doubled"),
+			}},
+		},
+
+		// v2: aggregates
+		{
+			name:  "select count star",
+			input: "SELECT COUNT(*)",
+			want:  &SelectStmt{Columns: []Projection{proj(aggStar())}},
+		},
+		{
+			name:  "select count star with alias",
+			input: "SELECT COUNT(*) AS n",
+			want:  &SelectStmt{Columns: []Projection{projAs(aggStar(), "n")}},
+		},
+		{
+			name:  "select sum column",
+			input: "SELECT SUM(price)",
+			want:  &SelectStmt{Columns: []Projection{proj(aggE("SUM", colE("price")))}},
+		},
+		{
+			name:  "select avg expression",
+			input: "SELECT AVG(price * qty)",
+			want: &SelectStmt{Columns: []Projection{
+				proj(aggE("AVG", binE("*", colE("price"), colE("qty")))),
+			}},
+		},
+		{
+			name:  "select multiple aggregates",
+			input: "SELECT COUNT(*), MIN(price), MAX(price)",
+			want: &SelectStmt{Columns: []Projection{
+				proj(aggStar()),
+				proj(aggE("MIN", colE("price"))),
+				proj(aggE("MAX", colE("price"))),
+			}},
+		},
+		{
+			name:  "aggregate names are case insensitive",
+			input: "SELECT count(*), sum(price)",
+			want: &SelectStmt{Columns: []Projection{
+				proj(aggStar()),
+				proj(aggE("SUM", colE("price"))),
+			}},
+		},
+		{
+			name:    "non-count aggregate rejects star",
+			input:   "SELECT SUM(*)",
+			wantErr: "only COUNT accepts '*'",
+		},
+
+		// v2: GROUP BY
+		{
+			name:  "group by single column",
+			input: "SELECT Status, COUNT(*) GROUP BY Status",
+			want: &SelectStmt{
+				Columns: []Projection{
+					proj(colE("Status")),
+					proj(aggStar()),
+				},
+				GroupBy: []string{"Status"},
+			},
+		},
+		{
+			name:  "group by multiple columns",
+			input: "SELECT Status, Priority, COUNT(*) GROUP BY Status, Priority",
+			want: &SelectStmt{
+				Columns: []Projection{
+					proj(colE("Status")),
+					proj(colE("Priority")),
+					proj(aggStar()),
+				},
+				GroupBy: []string{"Status", "Priority"},
+			},
+		},
+		{
+			name:    "group missing by",
+			input:   "SELECT Status, COUNT(*) GROUP Status",
+			wantErr: "BY",
+		},
+
+		// v2: HAVING
+		{
+			name:  "having on aggregate",
+			input: "SELECT Status, COUNT(*) AS n GROUP BY Status HAVING COUNT(*) > 5",
+			want: &SelectStmt{
+				Columns: []Projection{
+					proj(colE("Status")),
+					projAs(aggStar(), "n"),
+				},
+				GroupBy: []string{"Status"},
+				Having:  cmpE(aggStar(), ">", vnum("5")),
+			},
+		},
+		{
+			name:  "having on sum",
+			input: "SELECT Status GROUP BY Status HAVING SUM(price) > 100",
+			want: &SelectStmt{
+				Columns: []Projection{proj(colE("Status"))},
+				GroupBy: []string{"Status"},
+				Having:  cmpE(aggE("SUM", colE("price")), ">", vnum("100")),
+			},
+		},
+
+		// v2: expression on WHERE LHS (path B unification)
+		{
+			name:  "where arithmetic on lhs",
+			input: "SELECT * WHERE price * qty > 100",
+			want: &SelectStmt{
+				Star:  true,
+				Where: cmpE(binE("*", colE("price"), colE("qty")), ">", vnum("100")),
+			},
+		},
+
+		// v2: UPDATE with computed RHS
+		{
+			name:  "update with arithmetic rhs",
+			input: "UPDATE SET counter = counter + 1",
+			want: &UpdateStmt{
+				Assignments: []Assignment{
+					{Column: "counter", Value: binE("+", colE("counter"), litE(vnum("1")))},
+				},
+			},
+		},
+
+		// v2: clause ordering
+		{
+			name:  "all v2 clauses combined",
+			input: "SELECT Status, COUNT(*) AS n WHERE Priority > 1 GROUP BY Status HAVING COUNT(*) > 2 ORDER BY n DESC LIMIT 10",
+			want: &SelectStmt{
+				Columns: []Projection{
+					proj(colE("Status")),
+					projAs(aggStar(), "n"),
+				},
+				Where:   cmp("Priority", ">", vnum("1")),
+				GroupBy: []string{"Status"},
+				Having:  cmpE(aggStar(), ">", vnum("2")),
+				OrderBy: []OrderKey{desc("n")},
+				Limit:   iptr(10),
+			},
+		},
+
+		// v2: MIN / MAX usable as column names
+		{
+			name:  "min as column name (no parens)",
+			input: "SELECT min, max",
+			want: &SelectStmt{Columns: []Projection{
+				proj(colE("min")),
+				proj(colE("max")),
+			}},
 		},
 	}
 

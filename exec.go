@@ -45,6 +45,12 @@ func (e *Executor) Execute(stmt Stmt, commit bool) error {
 }
 
 func (e *Executor) executeSelect(sel *SelectStmt) error {
+	if len(sel.GroupBy) > 0 {
+		return fmt.Errorf("GROUP BY parses in v2.0-alpha but executor support lands in v2.0")
+	}
+	if sel.Having != nil {
+		return fmt.Errorf("HAVING parses in v2.0-alpha but executor support lands in v2.0")
+	}
 	cols, err := e.resolveProjection(sel)
 	if err != nil {
 		return err
@@ -198,16 +204,28 @@ func distinctKey(row Row, cols []string, table *Table, ctx *EvalContext) string 
 
 // resolveProjection decides which columns to return. SELECT * uses every
 // column in header order. An explicit list is validated against the schema.
+// v2.0-alpha is parser-only for arithmetic / aggregates / aliases — those
+// parse cleanly but error at execution time so a v1-shape query keeps
+// running while the broader executor lands in v2.0.
 func (e *Executor) resolveProjection(sel *SelectStmt) ([]string, error) {
 	if sel.Star {
 		return append([]string(nil), e.Table.Columns...), nil
 	}
-	for _, c := range sel.Columns {
-		if _, ok := e.Table.Schema[c]; !ok {
-			return nil, fmt.Errorf("unknown column %q (not in CSV header)", c)
+	cols := make([]string, 0, len(sel.Columns))
+	for _, pr := range sel.Columns {
+		if pr.Alias != "" {
+			return nil, fmt.Errorf("AS aliases parse in v2.0-alpha but executor support lands in v2.0")
 		}
+		name, ok := columnName(pr.Expr)
+		if !ok {
+			return nil, fmt.Errorf("projection expressions parse in v2.0-alpha but executor support lands in v2.0")
+		}
+		if _, ok := e.Table.Schema[name]; !ok {
+			return nil, fmt.Errorf("unknown column %q (not in CSV header)", name)
+		}
+		cols = append(cols, name)
 	}
-	return sel.Columns, nil
+	return cols, nil
 }
 
 func (e *Executor) executeUpdate(upd *UpdateStmt, commit bool) error {
@@ -226,7 +244,7 @@ func (e *Executor) executeUpdate(upd *UpdateStmt, commit bool) error {
 
 	fmt.Fprintf(e.Out, "Would update %d row%s in %s:\n", len(matches), plural(len(matches)), e.Table.Path)
 	for _, a := range upd.Assignments {
-		fmt.Fprintf(e.Out, "  SET %s = %s\n", a.Column, renderLiteral(a.Value))
+		fmt.Fprintf(e.Out, "  SET %s = %s\n", a.Column, renderExpr(a.Value))
 	}
 	e.printSample(matches)
 
@@ -306,7 +324,7 @@ func (e *Executor) executeInsert(ins *InsertStmt, commit bool) error {
 	}
 	assigns := make([]Assignment, len(ins.Columns))
 	for i, c := range ins.Columns {
-		assigns[i] = Assignment{Column: c, Value: ins.Values[i]}
+		assigns[i] = Assignment{Column: c, Value: &LiteralExpr{Value: ins.Values[i]}}
 	}
 	cells, err := e.buildAssignmentCells(assigns)
 	if err != nil {
@@ -385,7 +403,11 @@ func (e *Executor) buildAssignmentCells(assigns []Assignment) (map[string]Cell, 
 		if !ok {
 			return nil, fmt.Errorf("unknown column %q", a.Column)
 		}
-		c, err := CoerceLiteral(a.Value, info.Type)
+		lit, ok := a.Value.(*LiteralExpr)
+		if !ok {
+			return nil, fmt.Errorf("column %q: computed assignments parse in v2.0-alpha but executor support lands in v2.0", a.Column)
+		}
+		c, err := CoerceLiteral(lit.Value, info.Type)
 		if err != nil {
 			return nil, fmt.Errorf("column %q: %w", a.Column, err)
 		}
@@ -493,4 +515,14 @@ func findValue(ins *InsertStmt, c string) Value {
 		}
 	}
 	return Value{Kind: ValNull}
+}
+
+// renderExpr is the preview-friendly form of an assignment RHS. In
+// v2.0-alpha the executor only commits LiteralExpr assignments, so by the
+// time the preview prints, anything richer has already been rejected.
+func renderExpr(e Expr) string {
+	if lit, ok := e.(*LiteralExpr); ok {
+		return renderLiteral(lit.Value)
+	}
+	return "<expr>"
 }

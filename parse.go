@@ -16,21 +16,32 @@ func (*DeleteStmt) stmt() {}
 func (*InsertStmt) stmt() {}
 
 // SelectStmt represents a SELECT. Star is true for `SELECT *`; in that case
-// Columns is nil. Distinct is true for `SELECT DISTINCT ...`. OrderBy is the
-// list of sort keys in user order. Limit and Offset are pointers so that
-// "unset" is distinguishable from explicit 0.
+// Columns is nil. Distinct is true for `SELECT DISTINCT ...`. GroupBy is the
+// list of bare column names in user order; expressions in GROUP BY are a
+// future-version feature. Having is the post-aggregation predicate.
 type SelectStmt struct {
 	Distinct bool
 	Star     bool
-	Columns  []string
+	Columns  []Projection
 	Where    Predicate
+	GroupBy  []string
+	Having   Predicate
 	OrderBy  []OrderKey
 	Limit    *int
 	Offset   *int
 }
 
+// Projection is one entry in a SELECT list. Alias is "" when the user did
+// not write an `AS <name>` clause; renderers may synthesize a display label
+// in that case.
+type Projection struct {
+	Expr  Expr
+	Alias string
+}
+
 // OrderKey is one entry in an ORDER BY list: a column and a direction.
-// Desc=false is ASC.
+// Desc=false is ASC. ORDER BY is column-only in v2; expression keys are
+// deferred to v2.1.
 type OrderKey struct {
 	Column string
 	Desc   bool
@@ -50,12 +61,47 @@ type InsertStmt struct {
 	Values  []Value
 }
 
+// Assignment is one `col = <expr>` in UPDATE SET. The RHS is an Expr so that
+// v2 can support computed assignments like `SET counter = counter + 1`.
 type Assignment struct {
 	Column string
-	Value  Value
+	Value  Expr
 }
 
-// Predicate is the WHERE tree.
+// Expr is the projection / assignment-RHS / comparison-LHS expression tree.
+
+type Expr interface{ expr() }
+
+func (*ColumnExpr) expr()    {}
+func (*LiteralExpr) expr()   {}
+func (*BinaryExpr) expr()    {}
+func (*AggregateExpr) expr() {}
+
+type ColumnExpr struct {
+	Name string
+}
+
+type LiteralExpr struct {
+	Value Value
+}
+
+// BinaryExpr carries an arithmetic op: "+", "-", "*", "/".
+type BinaryExpr struct {
+	Op string
+	L  Expr
+	R  Expr
+}
+
+// AggregateExpr is one of COUNT, SUM, AVG, MIN, MAX. Star is true only for
+// COUNT(*); Arg is meaningful otherwise. Nested aggregates and DISTINCT
+// arguments are not enforced at parse time — the executor decides.
+type AggregateExpr struct {
+	Func string
+	Star bool
+	Arg  Expr
+}
+
+// Predicate is the WHERE / HAVING tree.
 
 type Predicate interface{ predicate() }
 
@@ -78,11 +124,13 @@ type NotOp struct {
 	Inner Predicate
 }
 
-// Comparison: column op literal. Op is one of "=", "!=", "<", "<=", ">", ">=".
+// Comparison: <expr> op literal. Op is one of "=", "!=", "<", "<=", ">", ">=".
+// The LHS broadens to a full Expr in v2 so `WHERE price * qty > 100` and
+// `HAVING COUNT(*) > 5` share one node shape.
 type Comparison struct {
-	Column string
-	Op     string
-	Value  Value
+	LExpr Expr
+	Op    string
+	Value Value
 }
 
 // NullTest: column IS [NOT] NULL.
@@ -200,6 +248,9 @@ const (
 	TokString
 	TokNumber
 	TokStar
+	TokPlus
+	TokMinus
+	TokSlash
 	TokLParen
 	TokRParen
 	TokComma
@@ -225,7 +276,10 @@ const (
 	TokTrue
 	TokFalse
 	TokOrder
+	TokGroup
+	TokHaving
 	TokBy
+	TokAs
 	TokAsc
 	TokDesc
 	TokLimit
@@ -259,7 +313,10 @@ var keywords = map[string]TokenType{
 	"TRUE":     TokTrue,
 	"FALSE":    TokFalse,
 	"ORDER":    TokOrder,
+	"GROUP":    TokGroup,
+	"HAVING":   TokHaving,
 	"BY":       TokBy,
+	"AS":       TokAs,
 	"ASC":      TokAsc,
 	"DESC":     TokDesc,
 	"LIMIT":    TokLimit,
@@ -270,6 +327,18 @@ var keywords = map[string]TokenType{
 	"BETWEEN":  TokBetween,
 }
 
+// aggregateNames is checked in parseFactor when a TokIdent is followed by '('.
+// Names that match (case-insensitive) become AggregateExpr nodes; everything
+// else stays a column reference. Listing them outside `keywords` keeps `MIN`,
+// `MAX`, etc. usable as bare column names.
+var aggregateNames = map[string]string{
+	"COUNT": "COUNT",
+	"SUM":   "SUM",
+	"AVG":   "AVG",
+	"MIN":   "MIN",
+	"MAX":   "MAX",
+}
+
 type lexer struct {
 	src string
 	pos int
@@ -277,12 +346,7 @@ type lexer struct {
 
 // skipWhitespace also discards SQL comments. Line comments start with `--`
 // and run to end-of-line (or end-of-input); block comments start with `/*`
-// and run to `*/`. Block comments do not nest, matching ANSI SQL (Postgres
-// permits nesting but the standard doesn't). An unterminated block comment
-// returns an error via the lexer's error channel — but we have none, so the
-// surrounding tokenizer will see the run as whitespace and continue, which
-// will surface as a parse error at the next real token; that's acceptable
-// for a SQL REPL where the user can just retype.
+// and run to `*/`. Block comments do not nest, matching ANSI SQL.
 func (l *lexer) skipWhitespace() {
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
@@ -332,7 +396,7 @@ func (l *lexer) next() (Token, error) {
 		return l.lexString(start)
 	case c == '"':
 		return l.lexQuotedIdent(start)
-	case c == '-' || isDigit(c):
+	case isDigit(c):
 		return l.lexNumber(start)
 	case isLetter(c) || c == '_':
 		return l.lexIdent(start)
@@ -342,6 +406,15 @@ func (l *lexer) next() (Token, error) {
 	case '*':
 		l.pos++
 		return Token{Type: TokStar, Lit: "*", Pos: start}, nil
+	case '+':
+		l.pos++
+		return Token{Type: TokPlus, Lit: "+", Pos: start}, nil
+	case '-':
+		l.pos++
+		return Token{Type: TokMinus, Lit: "-", Pos: start}, nil
+	case '/':
+		l.pos++
+		return Token{Type: TokSlash, Lit: "/", Pos: start}, nil
 	case '(':
 		l.pos++
 		return Token{Type: TokLParen, Lit: "(", Pos: start}, nil
@@ -427,12 +500,6 @@ func (l *lexer) lexQuotedIdent(start int) (Token, error) {
 }
 
 func (l *lexer) lexNumber(start int) (Token, error) {
-	if l.src[l.pos] == '-' {
-		l.pos++
-		if l.pos >= len(l.src) || !isDigit(l.src[l.pos]) {
-			return Token{}, parseErrorAt(start, "expected digit after '-'")
-		}
-	}
 	for l.pos < len(l.src) && isDigit(l.src[l.pos]) {
 		l.pos++
 	}
@@ -488,6 +555,14 @@ func newParser(input string) (*parser, error) {
 }
 
 func (p *parser) peek() Token { return p.tokens[p.pos] }
+
+func (p *parser) peekAt(offset int) Token {
+	i := p.pos + offset
+	if i >= len(p.tokens) {
+		return p.tokens[len(p.tokens)-1]
+	}
+	return p.tokens[i]
+}
 
 func (p *parser) advance() Token {
 	t := p.tokens[p.pos]
@@ -548,11 +623,11 @@ func (p *parser) parseSelectBody() (Stmt, error) {
 	if _, ok := p.accept(TokStar); ok {
 		sel.Star = true
 	} else {
-		cols, err := p.parseColumnList()
+		projs, err := p.parseProjectionList()
 		if err != nil {
 			return nil, err
 		}
-		sel.Columns = cols
+		sel.Columns = projs
 	}
 	if _, ok := p.accept(TokWhere); ok {
 		pred, err := p.parsePredicate()
@@ -560,6 +635,20 @@ func (p *parser) parseSelectBody() (Stmt, error) {
 			return nil, err
 		}
 		sel.Where = pred
+	}
+	if _, ok := p.accept(TokGroup); ok {
+		cols, err := p.parseGroupBy()
+		if err != nil {
+			return nil, err
+		}
+		sel.GroupBy = cols
+	}
+	if _, ok := p.accept(TokHaving); ok {
+		pred, err := p.parsePredicate()
+		if err != nil {
+			return nil, err
+		}
+		sel.Having = pred
 	}
 	if _, ok := p.accept(TokOrder); ok {
 		keys, err := p.parseOrderBy()
@@ -586,6 +675,63 @@ func (p *parser) parseSelectBody() (Stmt, error) {
 		return nil, err
 	}
 	return sel, nil
+}
+
+func (p *parser) parseProjectionList() ([]Projection, error) {
+	first, err := p.parseProjection()
+	if err != nil {
+		return nil, err
+	}
+	projs := []Projection{first}
+	for {
+		if _, ok := p.accept(TokComma); !ok {
+			break
+		}
+		pr, err := p.parseProjection()
+		if err != nil {
+			return nil, err
+		}
+		projs = append(projs, pr)
+	}
+	return projs, nil
+}
+
+func (p *parser) parseProjection() (Projection, error) {
+	e, err := p.parseExpr()
+	if err != nil {
+		return Projection{}, err
+	}
+	pr := Projection{Expr: e}
+	if _, ok := p.accept(TokAs); ok {
+		alias, err := p.parseIdent("alias name after AS")
+		if err != nil {
+			return Projection{}, err
+		}
+		pr.Alias = alias
+	}
+	return pr, nil
+}
+
+func (p *parser) parseGroupBy() ([]string, error) {
+	if _, err := p.expect(TokBy, "BY after GROUP"); err != nil {
+		return nil, err
+	}
+	first, err := p.parseColumn()
+	if err != nil {
+		return nil, err
+	}
+	cols := []string{first}
+	for {
+		if _, ok := p.accept(TokComma); !ok {
+			break
+		}
+		c, err := p.parseColumn()
+		if err != nil {
+			return nil, err
+		}
+		cols = append(cols, c)
+	}
+	return cols, nil
 }
 
 func (p *parser) parseOrderBy() ([]OrderKey, error) {
@@ -630,14 +776,16 @@ func (p *parser) parseOrderKey() (OrderKey, error) {
 // objected.
 func (p *parser) parseNonNegativeInt(clause string) (int, error) {
 	t := p.peek()
+	if t.Type == TokMinus {
+		p.advance()
+		next := p.peek()
+		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s requires a non-negative integer, got -%s", clause, next.Lit))
+	}
 	if t.Type != TokNumber {
 		return 0, parseErrorAt(t.Pos, fmt.Sprintf("expected non-negative integer after %s, got %s", clause, describeToken(t)))
 	}
 	if strings.ContainsRune(t.Lit, '.') {
 		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s requires an integer, got %s", clause, t.Lit))
-	}
-	if strings.HasPrefix(t.Lit, "-") {
-		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s requires a non-negative integer, got %s", clause, t.Lit))
 	}
 	n, err := strconv.Atoi(t.Lit)
 	if err != nil {
@@ -688,11 +836,11 @@ func (p *parser) parseAssignment() (Assignment, error) {
 	if _, err := p.expect(TokEq, "'='"); err != nil {
 		return Assignment{}, err
 	}
-	v, err := p.parseValue()
+	e, err := p.parseExpr()
 	if err != nil {
 		return Assignment{}, err
 	}
-	return Assignment{Column: col, Value: v}, nil
+	return Assignment{Column: col, Value: e}, nil
 }
 
 func (p *parser) parseDeleteBody() (Stmt, error) {
@@ -779,6 +927,20 @@ func (p *parser) parseColumn() (string, error) {
 	return "", parseErrorAt(t.Pos, fmt.Sprintf("expected column name, got %s", describeToken(t)))
 }
 
+func (p *parser) parseIdent(what string) (string, error) {
+	t := p.peek()
+	if t.Type == TokIdent || t.Type == TokQuotedIdent {
+		p.advance()
+		return t.Lit, nil
+	}
+	return "", parseErrorAt(t.Pos, fmt.Sprintf("expected %s, got %s", what, describeToken(t)))
+}
+
+// parseValue accepts a literal in WHERE-RHS / IN-list / BETWEEN-bound /
+// INSERT-VALUES position. `- <number>` is folded into a single negative
+// numeric literal so the AST keeps Value semantics. The parser does not
+// accept compound expressions here in v2; if literals turn into expressions
+// it would be in a later version.
 func (p *parser) parseValue() (Value, error) {
 	t := p.peek()
 	switch t.Type {
@@ -788,6 +950,14 @@ func (p *parser) parseValue() (Value, error) {
 	case TokNumber:
 		p.advance()
 		return Value{Kind: ValNumber, Num: t.Lit}, nil
+	case TokMinus:
+		minusTok := p.advance()
+		next := p.peek()
+		if next.Type != TokNumber {
+			return Value{}, parseErrorAt(minusTok.Pos, fmt.Sprintf("expected number after '-', got %s", describeToken(next)))
+		}
+		p.advance()
+		return Value{Kind: ValNumber, Num: "-" + next.Lit}, nil
 	case TokTrue:
 		p.advance()
 		return Value{Kind: ValBool, Bool: true}, nil
@@ -799,6 +969,126 @@ func (p *parser) parseValue() (Value, error) {
 		return Value{Kind: ValNull}, nil
 	}
 	return Value{}, parseErrorAt(t.Pos, fmt.Sprintf("expected literal value, got %s", describeToken(t)))
+}
+
+// Expression grammar:
+//
+//   expr   := term (('+' | '-') term)*
+//   term   := factor (('*' | '/') factor)*
+//   factor := <column> | <literal> | <aggregate> | '(' expr ')'
+//
+// '(' inside an expression always starts a sub-expression; predicate
+// grouping is handled at the WHERE / HAVING atom level instead, so the two
+// rules never overlap.
+
+func (p *parser) parseExpr() (Expr, error) {
+	left, err := p.parseTerm()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		var op string
+		switch p.peek().Type {
+		case TokPlus:
+			op = "+"
+		case TokMinus:
+			op = "-"
+		default:
+			return left, nil
+		}
+		p.advance()
+		right, err := p.parseTerm()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: op, L: left, R: right}
+	}
+}
+
+func (p *parser) parseTerm() (Expr, error) {
+	left, err := p.parseFactor()
+	if err != nil {
+		return nil, err
+	}
+	for {
+		var op string
+		switch p.peek().Type {
+		case TokStar:
+			op = "*"
+		case TokSlash:
+			op = "/"
+		default:
+			return left, nil
+		}
+		p.advance()
+		right, err := p.parseFactor()
+		if err != nil {
+			return nil, err
+		}
+		left = &BinaryExpr{Op: op, L: left, R: right}
+	}
+}
+
+func (p *parser) parseFactor() (Expr, error) {
+	t := p.peek()
+	switch t.Type {
+	case TokLParen:
+		p.advance()
+		e, err := p.parseExpr()
+		if err != nil {
+			return nil, err
+		}
+		if _, err := p.expect(TokRParen, "')'"); err != nil {
+			return nil, err
+		}
+		return e, nil
+	case TokString, TokNumber, TokTrue, TokFalse, TokNull, TokMinus:
+		v, err := p.parseValue()
+		if err != nil {
+			return nil, err
+		}
+		return &LiteralExpr{Value: v}, nil
+	case TokQuotedIdent:
+		p.advance()
+		return &ColumnExpr{Name: t.Lit}, nil
+	case TokIdent:
+		// Aggregate call if followed by '(' and the name matches a known
+		// aggregate; otherwise a bare column reference. The lookahead keeps
+		// MIN / MAX / COUNT etc. usable as column names elsewhere.
+		if p.peekAt(1).Type == TokLParen {
+			if fn, ok := aggregateNames[strings.ToUpper(t.Lit)]; ok {
+				p.advance() // consume name
+				p.advance() // consume '('
+				return p.parseAggregateBody(fn)
+			}
+		}
+		p.advance()
+		return &ColumnExpr{Name: t.Lit}, nil
+	}
+	return nil, parseErrorAt(t.Pos, fmt.Sprintf("expected expression, got %s", describeToken(t)))
+}
+
+// parseAggregateBody is called after the function name and '(' have been
+// consumed. Handles COUNT(*) specially; for the other aggregates a single
+// argument expression is required.
+func (p *parser) parseAggregateBody(fn string) (Expr, error) {
+	if _, ok := p.accept(TokStar); ok {
+		if fn != "COUNT" {
+			return nil, parseErrorAt(p.peek().Pos, fmt.Sprintf("only COUNT accepts '*'; %s requires a column expression", fn))
+		}
+		if _, err := p.expect(TokRParen, "')'"); err != nil {
+			return nil, err
+		}
+		return &AggregateExpr{Func: fn, Star: true}, nil
+	}
+	arg, err := p.parseExpr()
+	if err != nil {
+		return nil, err
+	}
+	if _, err := p.expect(TokRParen, "')'"); err != nil {
+		return nil, err
+	}
+	return &AggregateExpr{Func: fn, Arg: arg}, nil
 }
 
 func (p *parser) parsePredicate() (Predicate, error) {
@@ -852,6 +1142,18 @@ func (p *parser) parseNegation() (Predicate, error) {
 	return p.parseAtom()
 }
 
+// parseAtom is one predicate leaf. The grammar:
+//
+//   atom := '(' predicate ')'
+//        | <expr> IS [NOT] NULL                  // <expr> must be a column
+//        | <expr> [NOT] LIKE 'pattern'           // <expr> must be a column
+//        | <expr> [NOT] ILIKE 'pattern'          // <expr> must be a column
+//        | <expr> [NOT] IN (v, ...)              // <expr> must be a column
+//        | <expr> [NOT] BETWEEN low AND high     // <expr> must be a column
+//        | <expr> <cmp-op> <literal>             // <expr> is unconstrained
+//
+// The column-only constraint for IS / LIKE / IN / BETWEEN is enforced after
+// the LHS is parsed so the error points at the bad expression, not the op.
 func (p *parser) parseAtom() (Predicate, error) {
 	if _, ok := p.accept(TokLParen); ok {
 		inner, err := p.parsePredicate()
@@ -863,11 +1165,15 @@ func (p *parser) parseAtom() (Predicate, error) {
 		}
 		return inner, nil
 	}
-	col, err := p.parseColumn()
+	lhs, err := p.parseExpr()
 	if err != nil {
 		return nil, err
 	}
 	if _, ok := p.accept(TokIs); ok {
+		col, ok := columnName(lhs)
+		if !ok {
+			return nil, parseErrorAt(p.peek().Pos, "IS NULL requires a column on the left")
+		}
 		not := false
 		if _, ok := p.accept(TokNot); ok {
 			not = true
@@ -877,20 +1183,33 @@ func (p *parser) parseAtom() (Predicate, error) {
 		}
 		return &NullTest{Column: col, Not: not}, nil
 	}
-	// Postfix NOT applies only to LIKE / IN / BETWEEN. If we accept NOT here
-	// but don't see one of those next, the parser produces an error pointing
-	// at the NOT.
 	notTok, hasNot := p.accept(TokNot)
 	if _, ok := p.accept(TokLike); ok {
+		col, ok := columnName(lhs)
+		if !ok {
+			return nil, parseErrorAt(notTok.Pos, "LIKE requires a column on the left")
+		}
 		return p.parseLikeBody(col, hasNot, false)
 	}
 	if _, ok := p.accept(TokILike); ok {
+		col, ok := columnName(lhs)
+		if !ok {
+			return nil, parseErrorAt(notTok.Pos, "ILIKE requires a column on the left")
+		}
 		return p.parseLikeBody(col, hasNot, true)
 	}
 	if _, ok := p.accept(TokIn); ok {
+		col, ok := columnName(lhs)
+		if !ok {
+			return nil, parseErrorAt(notTok.Pos, "IN requires a column on the left")
+		}
 		return p.parseInBody(col, hasNot)
 	}
 	if _, ok := p.accept(TokBetween); ok {
+		col, ok := columnName(lhs)
+		if !ok {
+			return nil, parseErrorAt(notTok.Pos, "BETWEEN requires a column on the left")
+		}
 		return p.parseBetweenBody(col, hasNot)
 	}
 	if hasNot {
@@ -922,7 +1241,16 @@ func (p *parser) parseAtom() (Predicate, error) {
 	if v.Kind == ValNull {
 		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("cannot use '%s' with NULL; use IS NULL or IS NOT NULL instead", op))
 	}
-	return &Comparison{Column: col, Op: op, Value: v}, nil
+	return &Comparison{LExpr: lhs, Op: op, Value: v}, nil
+}
+
+// columnName returns the column name when e is a bare ColumnExpr. Used by
+// the IS / LIKE / IN / BETWEEN paths to enforce their column-only LHS.
+func columnName(e Expr) (string, bool) {
+	if c, ok := e.(*ColumnExpr); ok {
+		return c.Name, true
+	}
+	return "", false
 }
 
 func (p *parser) parseLikeBody(col string, not, insensitive bool) (Predicate, error) {
