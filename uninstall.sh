@@ -7,8 +7,11 @@
 #   curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/uninstall.sh | sh
 #
 # Environment variables:
-#   SQLCSV_UNINSTALL_YES=1  Skip the interactive confirmation (assume yes)
-#   SQLCSV_PURGE=1          Also remove ~/.config/sqlcsv/ (history, etc.)
+#   SQLCSV_UNINSTALL_YES=1  Skip the binary-removal confirmation (assume yes).
+#                           Does NOT imply purge: the config dir is kept
+#                           unless SQLCSV_PURGE=1 is also set.
+#   SQLCSV_PURGE=1          Also remove ~/.config/sqlcsv/ (history, etc.),
+#                           independent of SQLCSV_UNINSTALL_YES.
 
 set -eu
 
@@ -75,11 +78,18 @@ if [ -n "$LEFTOVER" ]; then
 	say "Re-run this uninstaller to remove it, or remove it manually."
 fi
 
-# Optional state cleanup. We only remove ~/.config/sqlcsv/ contents if
-# SQLCSV_PURGE=1 was passed, since some users like to keep their history.
+# Optional state cleanup, decoupled from the binary confirmation on purpose:
+# SQLCSV_UNINSTALL_YES means "don't ask me about the binary", NOT "delete my
+# data". Purging the history is opt-in via SQLCSV_PURGE=1 or an explicit
+# interactive yes — skipping prompts should never silently drop state.
 CONFIG_DIR="${XDG_CONFIG_HOME:-$HOME/.config}/sqlcsv"
 if [ -d "$CONFIG_DIR" ]; then
-	if [ "${SQLCSV_PURGE:-0}" = "1" ] || read_yes "Also remove $CONFIG_DIR (history)?"; then
+	if [ "${SQLCSV_PURGE:-0}" = "1" ]; then
+		rm -rf "$CONFIG_DIR"
+		say "Removed $CONFIG_DIR"
+	elif [ "${SQLCSV_UNINSTALL_YES:-0}" = "1" ]; then
+		say "Kept $CONFIG_DIR (history); set SQLCSV_PURGE=1 to remove it"
+	elif read_yes "Also remove $CONFIG_DIR (history)?"; then
 		rm -rf "$CONFIG_DIR"
 		say "Removed $CONFIG_DIR"
 	else

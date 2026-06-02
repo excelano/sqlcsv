@@ -100,7 +100,7 @@ Re-run the installer. If sqlcsv is already on your `PATH`, it upgrades the exist
 curl -fsSL https://raw.githubusercontent.com/excelano/sqlcsv/main/uninstall.sh | sh
 ```
 
-The uninstaller removes the `sqlcsv` binary it finds on `PATH` and asks before removing `~/.config/sqlcsv/` (REPL history). Run twice if you have duplicate installs in multiple directories. Skip the prompts with `SQLCSV_UNINSTALL_YES=1`; also drop the config dir with `SQLCSV_PURGE=1`.
+The uninstaller removes the `sqlcsv` binary it finds on `PATH` and asks before removing `~/.config/sqlcsv/` (REPL history). Run twice if you have duplicate installs in multiple directories. `SQLCSV_UNINSTALL_YES=1` skips the binary-removal prompt but keeps the config dir — the REPL history is only removed if you also pass `SQLCSV_PURGE=1` (or answer yes interactively).
 
 ## Usage
 
