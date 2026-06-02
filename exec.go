@@ -51,7 +51,7 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 	if sel.Having != nil {
 		return fmt.Errorf("HAVING parses in v2.0-alpha but executor support lands in v2.0")
 	}
-	cols, err := e.resolveProjection(sel)
+	plan, err := e.planProjection(sel)
 	if err != nil {
 		return err
 	}
@@ -74,37 +74,108 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 		}
 	}
 
-	if sel.Distinct {
-		seen := make(map[string]struct{}, len(matched))
-		out := matched[:0]
-		for _, idx := range matched {
-			key := distinctKey(e.Table.Rows[idx], cols, e.Table, ctx)
-			if _, dup := seen[key]; dup {
-				continue
-			}
-			seen[key] = struct{}{}
-			out = append(out, idx)
-		}
-		matched = out
-	}
-
 	if len(sel.OrderBy) > 0 {
 		e.sortByKeys(matched, sel.OrderBy, ctx)
 	}
 
-	matched = applyOffsetLimit(matched, sel.Offset, sel.Limit)
-
-	rows := make([]map[string]any, 0, len(matched))
+	// Evaluate the projection per matched row before DISTINCT / LIMIT so
+	// dedup operates on the user-visible output values rather than raw
+	// source cells. SELECT DISTINCT price * 0 collapses across all rows.
+	projected := make([][]Cell, 0, len(matched))
 	for _, idx := range matched {
 		row := e.Table.Rows[idx]
-		m := make(map[string]any, len(cols))
-		for _, c := range cols {
-			ci := ctx.ColIdx[c]
-			m[c] = row[ci].AsAny(e.Table.Schema[c].Type)
+		out := make([]Cell, len(plan))
+		for i, p := range plan {
+			res, err := EvalExpr(p.Expr, row, ctx)
+			if err != nil {
+				return err
+			}
+			out[i] = res.Cell
 		}
-		rows = append(rows, m)
+		projected = append(projected, out)
 	}
-	return Render(e.Out, Result{Columns: cols, Rows: rows}, e.Format)
+
+	if sel.Distinct {
+		seen := make(map[string]struct{}, len(projected))
+		out := projected[:0]
+		for _, pr := range projected {
+			key := projectedKey(pr, plan)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
+			out = append(out, pr)
+		}
+		projected = out
+	}
+
+	projected = applyOffsetLimitRows(projected, sel.Offset, sel.Limit)
+
+	labels := make([]string, len(plan))
+	for i, p := range plan {
+		labels[i] = p.Label
+	}
+	rows := make([]map[string]any, len(projected))
+	for i, pr := range projected {
+		m := make(map[string]any, len(plan))
+		for j, p := range plan {
+			m[p.Label] = pr[j].AsAny(p.Type)
+		}
+		rows[i] = m
+	}
+	return Render(e.Out, Result{Columns: labels, Rows: rows}, e.Format)
+}
+
+// projEntry is one entry in the SELECT projection plan: the output column
+// label, the expression to evaluate per row, and the result type used for
+// dedup key formatting and rendering.
+type projEntry struct {
+	Label string
+	Type  ColumnType
+	Expr  Expr
+}
+
+// applyOffsetLimitRows mirrors applyOffsetLimit but operates on projected
+// row slices instead of source-row indices. Slice 3 needs both shapes
+// because DISTINCT now runs after projection.
+func applyOffsetLimitRows(rows [][]Cell, offset, limit *int) [][]Cell {
+	if offset != nil {
+		if *offset >= len(rows) {
+			return rows[:0]
+		}
+		rows = rows[*offset:]
+	}
+	if limit != nil && *limit < len(rows) {
+		rows = rows[:*limit]
+	}
+	return rows
+}
+
+// projectedKey builds a dedup key from a projected row's typed cells. Same
+// scheme as distinctKey but reads from a positional Cell slice instead of
+// a Row keyed by column index.
+func projectedKey(pr []Cell, plan []projEntry) string {
+	var b strings.Builder
+	for i, p := range plan {
+		c := pr[i]
+		if c.Null {
+			b.WriteString("N|")
+			continue
+		}
+		switch p.Type {
+		case TypeInt:
+			fmt.Fprintf(&b, "I:%d|", c.Int)
+		case TypeFloat:
+			fmt.Fprintf(&b, "F:%g|", c.Float)
+		case TypeBool:
+			fmt.Fprintf(&b, "B:%t|", c.Bool)
+		case TypeDate:
+			fmt.Fprintf(&b, "D:%d|", c.Date.UnixNano())
+		default:
+			fmt.Fprintf(&b, "S:%d:%s|", len(c.Str), c.Str)
+		}
+	}
+	return b.String()
 }
 
 // validateOrderBy rejects sort keys that don't name a column in the table.
@@ -158,74 +229,48 @@ func compareForOrder(a, b Cell, t ColumnType) int {
 	return Compare(a, b, t)
 }
 
-// applyOffsetLimit returns the slice of indices after OFFSET m skips m rows
-// and LIMIT n keeps the first n. Either may be nil (no clause). OFFSET past
-// the end yields an empty slice; LIMIT 0 also yields an empty slice.
-func applyOffsetLimit(indices []int, offset, limit *int) []int {
-	if offset != nil {
-		if *offset >= len(indices) {
-			return indices[:0]
-		}
-		indices = indices[*offset:]
-	}
-	if limit != nil && *limit < len(indices) {
-		indices = indices[:*limit]
-	}
-	return indices
-}
-
-// distinctKey builds a per-row dedupe key from the projected columns. Typed
-// columns use unambiguous format verbs; string columns are length-prefixed so
-// embedded separators cannot collide.
-func distinctKey(row Row, cols []string, table *Table, ctx *EvalContext) string {
-	var b strings.Builder
-	for _, name := range cols {
-		idx := ctx.ColIdx[name]
-		c := row[idx]
-		if c.Null {
-			b.WriteString("N|")
-			continue
-		}
-		switch table.Schema[name].Type {
-		case TypeInt:
-			fmt.Fprintf(&b, "I:%d|", c.Int)
-		case TypeFloat:
-			fmt.Fprintf(&b, "F:%g|", c.Float)
-		case TypeBool:
-			fmt.Fprintf(&b, "B:%t|", c.Bool)
-		case TypeDate:
-			fmt.Fprintf(&b, "D:%d|", c.Date.UnixNano())
-		default:
-			fmt.Fprintf(&b, "S:%d:%s|", len(c.Str), c.Str)
-		}
-	}
-	return b.String()
-}
-
-// resolveProjection decides which columns to return. SELECT * uses every
-// column in header order. An explicit list is validated against the schema.
-// v2.0-alpha is parser-only for arithmetic / aggregates / aliases — those
-// parse cleanly but error at execution time so a v1-shape query keeps
-// running while the broader executor lands in v2.0.
-func (e *Executor) resolveProjection(sel *SelectStmt) ([]string, error) {
+// planProjection builds the typed projection plan for a SELECT. SELECT *
+// synthesizes one entry per table column. Otherwise each user projection
+// becomes a plan entry whose label is the alias if present, else the
+// expression's source-text rendering. Duplicate output labels are
+// rejected — the caller must alias to disambiguate, since the render
+// layer keys output rows by label.
+func (e *Executor) planProjection(sel *SelectStmt) ([]projEntry, error) {
 	if sel.Star {
-		return append([]string(nil), e.Table.Columns...), nil
+		plan := make([]projEntry, len(e.Table.Columns))
+		for i, name := range e.Table.Columns {
+			plan[i] = projEntry{
+				Label: name,
+				Type:  e.Table.Schema[name].Type,
+				Expr:  &ColumnExpr{Name: name},
+			}
+		}
+		return plan, nil
 	}
-	cols := make([]string, 0, len(sel.Columns))
+	plan := make([]projEntry, 0, len(sel.Columns))
+	seen := make(map[string]struct{}, len(sel.Columns))
 	for _, pr := range sel.Columns {
-		if pr.Alias != "" {
-			return nil, fmt.Errorf("AS aliases parse in v2.0-alpha but executor support lands in v2.0")
+		if err := validateExpr(pr.Expr, e.Table.Schema); err != nil {
+			return nil, err
 		}
-		name, ok := columnName(pr.Expr)
-		if !ok {
-			return nil, fmt.Errorf("projection expressions parse in v2.0-alpha but executor support lands in v2.0")
+		if hasAggregate(pr.Expr) {
+			return nil, fmt.Errorf("aggregates parse in v2.0-alpha but executor support lands in v2.0")
 		}
-		if _, ok := e.Table.Schema[name]; !ok {
-			return nil, fmt.Errorf("unknown column %q (not in CSV header)", name)
+		t, err := exprType(pr.Expr, e.Table.Schema)
+		if err != nil {
+			return nil, err
 		}
-		cols = append(cols, name)
+		label := pr.Alias
+		if label == "" {
+			label = renderExpr(pr.Expr)
+		}
+		if _, dup := seen[label]; dup {
+			return nil, fmt.Errorf("duplicate output column %q; use AS to give them distinct names", label)
+		}
+		seen[label] = struct{}{}
+		plan = append(plan, projEntry{Label: label, Type: t, Expr: pr.Expr})
 	}
-	return cols, nil
+	return plan, nil
 }
 
 func (e *Executor) executeUpdate(upd *UpdateStmt, commit bool) error {

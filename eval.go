@@ -204,6 +204,49 @@ func evalCellAsValue(e EvalCell) Value {
 	return Value{Kind: ValNull}
 }
 
+// exprType derives the result type of an expression without evaluating it.
+// Numeric literals with a decimal point are floats; integer-shaped numerics
+// are ints. NULL literals default to TypeString — the Null flag is what
+// matters at evaluation time. Arithmetic mirrors evalBinary: / always yields
+// float, + - * stay int when both operands are int and promote otherwise.
+// Aggregates are rejected here; planProjection handles them in slice 4.
+func exprType(e Expr, schema map[string]ColumnInfo) (ColumnType, error) {
+	switch n := e.(type) {
+	case *ColumnExpr:
+		info, ok := schema[n.Name]
+		if !ok {
+			return TypeString, fmt.Errorf("unknown column %q", n.Name)
+		}
+		return info.Type, nil
+	case *LiteralExpr:
+		switch n.Value.Kind {
+		case ValNumber:
+			if strings.ContainsRune(n.Value.Num, '.') {
+				return TypeFloat, nil
+			}
+			return TypeInt, nil
+		case ValString, ValNull:
+			return TypeString, nil
+		case ValBool:
+			return TypeBool, nil
+		}
+		return TypeString, fmt.Errorf("internal: unknown literal kind %d", n.Value.Kind)
+	case *BinaryExpr:
+		lt, err := exprType(n.L, schema)
+		if err != nil {
+			return TypeString, err
+		}
+		rt, err := exprType(n.R, schema)
+		if err != nil {
+			return TypeString, err
+		}
+		return arithResultType(lt, rt, n.Op), nil
+	case *AggregateExpr:
+		return TypeString, fmt.Errorf("aggregates parse in v2.0-alpha but executor support lands in v2.0")
+	}
+	return TypeString, fmt.Errorf("internal: unhandled expression type %T", e)
+}
+
 // hasAggregate reports whether the expression tree contains an aggregate
 // node. UPDATE SET and WHERE forbid aggregates; SELECT projection and
 // HAVING permit them.

@@ -61,6 +61,149 @@ func TestExecSelectProjection(t *testing.T) {
 	}
 }
 
+func TestExecSelectArithmeticProjection(t *testing.T) {
+	e, out, _ := newExec(t)
+	// Priority * 10 evaluated per row. Label synthesizes to "Priority * 10".
+	stmt, err := Parse("SELECT ID, Priority * 10 WHERE Status = 'Open' AND Priority IS NOT NULL")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if lines[0] != "ID\tPriority * 10" {
+		t.Errorf("header: %q", lines[0])
+	}
+	// Open rows with non-null priority: ID 1 (P=3), ID 3 (P=5) → 30, 50.
+	if !strings.Contains(out.String(), "1\t30") {
+		t.Errorf("expected 1\\t30: %q", out.String())
+	}
+	if !strings.Contains(out.String(), "3\t50") {
+		t.Errorf("expected 3\\t50: %q", out.String())
+	}
+}
+
+func TestExecSelectAlias(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Priority * 10 AS scaled WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if lines[0] != "scaled" {
+		t.Errorf("header should use alias: %q", lines[0])
+	}
+	if lines[1] != "30" {
+		t.Errorf("value: %q", lines[1])
+	}
+}
+
+func TestExecSelectMixedColumnAndExpression(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Title, Priority, Priority * 2 AS doubled WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if lines[0] != "Title\tPriority\tdoubled" {
+		t.Errorf("header: %q", lines[0])
+	}
+	if lines[1] != "Alpha\t3\t6" {
+		t.Errorf("row: %q", lines[1])
+	}
+}
+
+func TestExecSelectLiteralProjection(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID, 'fixed' AS label WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "1\tfixed") {
+		t.Errorf("expected literal projection: %q", out.String())
+	}
+}
+
+func TestExecSelectArithmeticNullRenders(t *testing.T) {
+	// Row 4 has Priority=NULL. Priority * 2 should render as empty trailing
+	// field. TrimSpace would eat the trailing tab/empty field, so strip only
+	// the final newline.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID, Priority * 2 WHERE ID = 4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimRight(out.String(), "\n"), "\n")
+	parts := strings.Split(lines[1], "\t")
+	if len(parts) != 2 || parts[0] != "4" || parts[1] != "" {
+		t.Errorf("NULL arithmetic should render as 4\\t<empty>: parts=%q", parts)
+	}
+}
+
+func TestExecSelectDuplicateLabelRejected(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT ID, ID")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("duplicate output label should error")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error should explain: %v", err)
+	}
+}
+
+func TestExecSelectDuplicateResolvedByAlias(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID, ID AS dup WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "ID\tdup") {
+		t.Errorf("alias should resolve collision: %q", out.String())
+	}
+}
+
+func TestExecSelectDistinctOverComputed(t *testing.T) {
+	// Priority * 0 evaluates to 0 for every non-null row, NULL for row 4.
+	// SELECT DISTINCT collapses to two output rows: one "0" and one empty.
+	// Each Fprintln appends a newline, so 3 lines means 3 newlines in the
+	// raw output.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT Priority * 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := out.String()
+	if n := strings.Count(got, "\n"); n != 3 {
+		t.Fatalf("expected 3 newlines (header + 2 rows), got %d: %q", n, got)
+	}
+	if got != "Priority * 0\n0\n\n" {
+		t.Errorf("rendered: %q", got)
+	}
+}
+
 func TestExecSelectDistinct(t *testing.T) {
 	// Fixture statuses: Open, Done, Open, Open → distinct {Open, Done}.
 	e, out, _ := newExec(t)
