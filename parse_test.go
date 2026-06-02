@@ -55,6 +55,37 @@ func TestParse(t *testing.T) {
 			want:  &SelectStmt{Columns: []string{`He said "hi"`}},
 		},
 
+		// DISTINCT
+		{
+			name:  "select distinct star",
+			input: "SELECT DISTINCT *",
+			want:  &SelectStmt{Distinct: true, Star: true},
+		},
+		{
+			name:  "select distinct single column",
+			input: "SELECT DISTINCT Status",
+			want:  &SelectStmt{Distinct: true, Columns: []string{"Status"}},
+		},
+		{
+			name:  "select distinct multiple columns",
+			input: "SELECT DISTINCT Status, Priority",
+			want:  &SelectStmt{Distinct: true, Columns: []string{"Status", "Priority"}},
+		},
+		{
+			name:  "select distinct lowercase",
+			input: "select distinct status",
+			want:  &SelectStmt{Distinct: true, Columns: []string{"status"}},
+		},
+		{
+			name:  "select distinct with where",
+			input: "SELECT DISTINCT Status WHERE Priority > 2",
+			want: &SelectStmt{
+				Distinct: true,
+				Columns:  []string{"Status"},
+				Where:    cmp("Priority", ">", vnum("2")),
+			},
+		},
+
 		// SELECT with WHERE: comparison operators
 		{
 			name:  "select where equals",

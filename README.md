@@ -16,6 +16,14 @@ sqlcsv> SELECT Title, Status WHERE Priority > 2
 | Backfill activity  | In Progress |
 (2 rows)
 
+sqlcsv> SELECT DISTINCT Status
+| Status      |
+| ----------- |
+| Open        |
+| In Progress |
+| Done        |
+(3 rows)
+
 sqlcsv> UPDATE SET Status = 'Done' WHERE Modified < '2024-01-01'
 Would update 8 rows in tasks.csv:
   SET Status = "Done"

@@ -53,6 +53,10 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 	}
 	ctx := NewEvalContext(e.Table)
 	rows := make([]map[string]any, 0, len(e.Table.Rows))
+	var seen map[string]struct{}
+	if sel.Distinct {
+		seen = make(map[string]struct{}, len(e.Table.Rows))
+	}
 	for _, row := range e.Table.Rows {
 		ok, err := Matches(sel.Where, row, ctx)
 		if err != nil {
@@ -60,6 +64,13 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 		}
 		if !ok {
 			continue
+		}
+		if sel.Distinct {
+			key := distinctKey(row, cols, e.Table, ctx)
+			if _, dup := seen[key]; dup {
+				continue
+			}
+			seen[key] = struct{}{}
 		}
 		m := make(map[string]any, len(cols))
 		for _, c := range cols {
@@ -69,6 +80,34 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 		rows = append(rows, m)
 	}
 	return Render(e.Out, Result{Columns: cols, Rows: rows}, e.Format)
+}
+
+// distinctKey builds a per-row dedupe key from the projected columns. Typed
+// columns use unambiguous format verbs; string columns are length-prefixed so
+// embedded separators cannot collide.
+func distinctKey(row Row, cols []string, table *Table, ctx *EvalContext) string {
+	var b strings.Builder
+	for _, name := range cols {
+		idx := ctx.ColIdx[name]
+		c := row[idx]
+		if c.Null {
+			b.WriteString("N|")
+			continue
+		}
+		switch table.Schema[name].Type {
+		case TypeInt:
+			fmt.Fprintf(&b, "I:%d|", c.Int)
+		case TypeFloat:
+			fmt.Fprintf(&b, "F:%g|", c.Float)
+		case TypeBool:
+			fmt.Fprintf(&b, "B:%t|", c.Bool)
+		case TypeDate:
+			fmt.Fprintf(&b, "D:%d|", c.Date.UnixNano())
+		default:
+			fmt.Fprintf(&b, "S:%d:%s|", len(c.Str), c.Str)
+		}
+	}
+	return b.String()
 }
 
 // resolveProjection decides which columns to return. SELECT * uses every

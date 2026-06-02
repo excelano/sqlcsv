@@ -13,7 +13,7 @@ This document uses a compact EBNF-style notation. `:=` defines a rule. `|` separ
 ```ebnf
 statement     := select_stmt | update_stmt | delete_stmt | insert_stmt
 
-select_stmt   := "SELECT" projection ( "WHERE" predicate )?
+select_stmt   := "SELECT" "DISTINCT"? projection ( "WHERE" predicate )?
 
 update_stmt   := "UPDATE" "SET" assignment ( "," assignment )*
                  ( "WHERE" predicate )?
@@ -34,6 +34,8 @@ assignment    := column "=" value
 ```
 
 `SELECT *` returns every column in the file. A column list returns only those columns in the order given.
+
+`SELECT DISTINCT` collapses rows that have identical values across the projected columns. Deduplication runs after `WHERE`, on the typed values (so an integer `1` and the string `"1"` from different columns are not treated as equal). Two `NULL`s in the same projected column are considered equal for the purpose of deduplication, matching standard SQL.
 
 ## Predicates
 
@@ -95,6 +97,8 @@ Valid statements under the v1 grammar:
 ```sql
 SELECT *
 SELECT Title, Status, "Created Date"
+SELECT DISTINCT Status
+SELECT DISTINCT Status, Priority WHERE Archived = FALSE
 SELECT Title WHERE Status = 'Open'
 SELECT Title WHERE Status = 'Open' AND Priority > 2
 SELECT Title WHERE (Status = 'Open' OR Status = 'In Review') AND NOT Archived = TRUE
@@ -121,6 +125,6 @@ Permanently out of scope: `JOIN` of any form. sqlcsv operates on a single file p
 
 Planned for v1.1: `LIKE` for substring matching, `IN` for set membership, `BETWEEN` for range tests, `ORDER BY`, `LIMIT`, and `OFFSET`.
 
-Planned for v2, requiring extra work: aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, `HAVING`, `DISTINCT`, and computed assignments like `SET col = col + 1`.
+Planned for v2, requiring extra work: aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, `HAVING`, and computed assignments like `SET col = col + 1`.
 
 No current plan: subqueries, scalar functions (`LOWER`, `UPPER`, `YEAR`, etc.), `AS` aliases, `UNION` / `INTERSECT` / `EXCEPT`, common table expressions, and SQL comments. None are technically impossible, but each adds parser complexity for a use case that has not surfaced yet.

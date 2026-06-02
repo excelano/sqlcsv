@@ -61,6 +61,112 @@ func TestExecSelectProjection(t *testing.T) {
 	}
 }
 
+func TestExecSelectDistinct(t *testing.T) {
+	// Fixture statuses: Open, Done, Open, Open → distinct {Open, Done}.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("DISTINCT Status: %d lines, want 3 (header + Open + Done): %q", len(lines), out.String())
+	}
+	if lines[0] != "Status" {
+		t.Errorf("header: %q", lines[0])
+	}
+	// First-seen order: Open, then Done.
+	if lines[1] != "Open" || lines[2] != "Done" {
+		t.Errorf("expected first-seen order Open, Done; got %q, %q", lines[1], lines[2])
+	}
+}
+
+func TestExecSelectDistinctStarNoCollapse(t *testing.T) {
+	// All four fixture rows differ across the full row, so DISTINCT * is a no-op.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT *")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 5 {
+		t.Fatalf("DISTINCT *: %d lines, want 5 (header + 4 rows): %q", len(lines), out.String())
+	}
+}
+
+func TestExecSelectDistinctWithWhere(t *testing.T) {
+	// WHERE filters first, then DISTINCT. Priority > 2 matches rows 1 (Open,3),
+	// 3 (Open,5), 4 (Open,NULL). DISTINCT Status collapses to just Open.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT Status WHERE Priority > 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 {
+		t.Fatalf("DISTINCT + WHERE: %d lines, want 2: %q", len(lines), out.String())
+	}
+	if lines[1] != "Open" {
+		t.Errorf("got %q, want Open", lines[1])
+	}
+}
+
+func TestExecSelectDistinctMultiColumn(t *testing.T) {
+	// Status × Archived pairs: (Open,false), (Done,true), (Open,false), (Open,false).
+	// Distinct: (Open,false), (Done,true) → 2 rows.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT Status, Archived")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("DISTINCT 2-col: %d lines, want 3 (header + 2): %q", len(lines), out.String())
+	}
+}
+
+func TestExecSelectDistinctNullsCollapse(t *testing.T) {
+	// Two rows with NULL Priority should collapse to one under DISTINCT —
+	// matches SQL's NULL-equal-to-NULL semantics for DISTINCT.
+	tbl := &Table{
+		Path:    "x.csv",
+		Columns: []string{"Priority"},
+		Schema:  map[string]ColumnInfo{"Priority": {Name: "Priority", Type: TypeInt}},
+		Rows: []Row{
+			{Cell{Null: true}},
+			{Cell{Int: 1}},
+			{Cell{Null: true}},
+		},
+		Delim:     ',',
+		HasHeader: true,
+	}
+	buf := &bytes.Buffer{}
+	e := &Executor{Table: tbl, Format: "tsv", Out: buf}
+	stmt, err := Parse("SELECT DISTINCT Priority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(buf.String()), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("got %d lines, want 3 (header + NULL + 1): %q", len(lines), buf.String())
+	}
+}
+
 func TestExecSelectUnknownColumn(t *testing.T) {
 	e, _, _ := newExec(t)
 	stmt, err := Parse("SELECT Nope")

@@ -15,11 +15,12 @@ func (*DeleteStmt) stmt() {}
 func (*InsertStmt) stmt() {}
 
 // SelectStmt represents a SELECT. Star is true for `SELECT *`; in that case
-// Columns is nil.
+// Columns is nil. Distinct is true for `SELECT DISTINCT ...`.
 type SelectStmt struct {
-	Star    bool
-	Columns []string
-	Where   Predicate
+	Distinct bool
+	Star     bool
+	Columns  []string
+	Where    Predicate
 }
 
 type UpdateStmt struct {
@@ -163,6 +164,7 @@ const (
 	TokGt
 	TokGe
 	TokSelect
+	TokDistinct
 	TokUpdate
 	TokDelete
 	TokInsert
@@ -185,20 +187,21 @@ type Token struct {
 }
 
 var keywords = map[string]TokenType{
-	"SELECT": TokSelect,
-	"UPDATE": TokUpdate,
-	"DELETE": TokDelete,
-	"INSERT": TokInsert,
-	"SET":    TokSet,
-	"VALUES": TokValues,
-	"WHERE":  TokWhere,
-	"AND":    TokAnd,
-	"OR":     TokOr,
-	"NOT":    TokNot,
-	"IS":     TokIs,
-	"NULL":   TokNull,
-	"TRUE":   TokTrue,
-	"FALSE":  TokFalse,
+	"SELECT":   TokSelect,
+	"DISTINCT": TokDistinct,
+	"UPDATE":   TokUpdate,
+	"DELETE":   TokDelete,
+	"INSERT":   TokInsert,
+	"SET":      TokSet,
+	"VALUES":   TokValues,
+	"WHERE":    TokWhere,
+	"AND":      TokAnd,
+	"OR":       TokOr,
+	"NOT":      TokNot,
+	"IS":       TokIs,
+	"NULL":     TokNull,
+	"TRUE":     TokTrue,
+	"FALSE":    TokFalse,
 }
 
 type lexer struct {
@@ -447,6 +450,9 @@ func (p *parser) parseStatement() (Stmt, error) {
 
 func (p *parser) parseSelectBody() (Stmt, error) {
 	sel := &SelectStmt{}
+	if _, ok := p.accept(TokDistinct); ok {
+		sel.Distinct = true
+	}
 	if _, ok := p.accept(TokStar); ok {
 		sel.Star = true
 	} else {
