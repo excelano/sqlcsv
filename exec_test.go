@@ -426,6 +426,315 @@ func TestExecSelectAggregateFloatColumn(t *testing.T) {
 	}
 }
 
+func TestExecSelectGroupByStatus(t *testing.T) {
+	// Fixture: Open=3 (rows 1,3,4), Done=1 (row 2). Insertion order Open first.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tCOUNT(*)\nOpen\t3\nDone\t1"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupBySumPerGroup(t *testing.T) {
+	// Open priorities: 3, 5, NULL → SUM=8. Done priorities: 1 → SUM=1.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, SUM(Priority) GROUP BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tSUM(Priority)\nOpen\t8\nDone\t1"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByMultipleColumns(t *testing.T) {
+	// (Status, Archived): (Open,false)=2, (Done,true)=1, (Open,false)dup, (Open,false)dup
+	// → (Open,false)=3, (Done,true)=1.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, Archived, COUNT(*) GROUP BY Status, Archived")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tArchived\tCOUNT(*)\nOpen\tfalse\t3\nDone\ttrue\t1"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByNullIsOwnGroup(t *testing.T) {
+	// Group by Priority: 3, 1, 5, NULL — each unique, NULL gets its own group.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Priority, COUNT(*) GROUP BY Priority")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := out.String()
+	// Four groups in insertion order: 3, 1, 5, NULL.
+	if !strings.Contains(got, "3\t1\n") || !strings.Contains(got, "1\t1\n") ||
+		!strings.Contains(got, "5\t1\n") {
+		t.Errorf("expected per-priority groups: %q", got)
+	}
+	// NULL group renders as empty field + 1.
+	if !strings.Contains(got, "\n\t1\n") {
+		t.Errorf("expected NULL group line: %q", got)
+	}
+}
+
+func TestExecSelectGroupByHaving(t *testing.T) {
+	// HAVING COUNT(*) > 1 keeps only Open (3 rows), drops Done (1 row).
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) AS n GROUP BY Status HAVING COUNT(*) > 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tn\nOpen\t3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByHavingAggregateNotInProjection(t *testing.T) {
+	// HAVING SUM(Priority) > 5 keeps Open (sum=8), drops Done (sum=1). The
+	// HAVING aggregate is not in the SELECT list — its slot lives in the
+	// shared template only.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status GROUP BY Status HAVING SUM(Priority) > 5")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\nOpen"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByWithWhere(t *testing.T) {
+	// WHERE Archived = false drops row 2 (Done/true). Remaining: 3 Open rows.
+	// GROUP BY Status → one group: Open=3.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) WHERE Archived = false GROUP BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tCOUNT(*)\nOpen\t3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByHavingArithmetic(t *testing.T) {
+	// AVG(Priority) per group: Open=(3+5)/2=4, Done=1. HAVING ratio > 2
+	// keeps Open only. Tests arithmetic over aggregates inside HAVING.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, AVG(Priority) AS avg_p GROUP BY Status HAVING SUM(Priority) / COUNT(*) > 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tavg_p\nOpen\t4"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByBareColumnRejected(t *testing.T) {
+	// Title is not in GROUP BY — plan-time rejection.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Title, COUNT(*) GROUP BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected error for Title not in GROUP BY")
+	}
+	if !strings.Contains(err.Error(), "Title") || !strings.Contains(err.Error(), "GROUP BY") {
+		t.Errorf("error should mention Title and GROUP BY: %v", err)
+	}
+}
+
+func TestExecSelectGroupByUnknownColumnRejected(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) GROUP BY Nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected unknown-column error")
+	}
+	if !strings.Contains(err.Error(), "Nope") {
+		t.Errorf("error should mention Nope: %v", err)
+	}
+}
+
+func TestExecSelectGroupByDuplicateColumnRejected(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status, Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected duplicate-column error")
+	}
+	if !strings.Contains(err.Error(), "duplicate") {
+		t.Errorf("error should mention duplicate: %v", err)
+	}
+}
+
+func TestExecSelectGroupByStarRejected(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT * GROUP BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected SELECT * + GROUP BY rejection")
+	}
+	if !strings.Contains(err.Error(), "SELECT *") {
+		t.Errorf("error should mention SELECT *: %v", err)
+	}
+}
+
+func TestExecSelectGroupByOrderByDefers(t *testing.T) {
+	// ORDER BY combined with GROUP BY/aggregates is slice 6 territory; until
+	// then the executor must surface a clear "lands in v2.0" message instead
+	// of silently sorting the wrong axis.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status ORDER BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected GROUP BY + ORDER BY defer")
+	}
+	if !strings.Contains(err.Error(), "ORDER BY") {
+		t.Errorf("error should mention ORDER BY: %v", err)
+	}
+}
+
+func TestExecSelectImplicitHavingKeeps(t *testing.T) {
+	// COUNT(*) = 4 > 0 → keep the row.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) HAVING COUNT(*) > 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "COUNT(*)\n4"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectImplicitHavingDrops(t *testing.T) {
+	// COUNT(*) = 4 < 100 → HAVING false → header only, no data row.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) HAVING COUNT(*) > 100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "COUNT(*)"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectImplicitHavingBareColumnRejected(t *testing.T) {
+	// No GROUP BY → no bare columns allowed in HAVING.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) HAVING Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected HAVING bare column rejection")
+	}
+	if !strings.Contains(err.Error(), "Status") || !strings.Contains(err.Error(), "HAVING") {
+		t.Errorf("error should mention HAVING and Status: %v", err)
+	}
+}
+
+func TestExecSelectHavingWithoutAggregationRejected(t *testing.T) {
+	// HAVING without GROUP BY and without any aggregate projection is a
+	// shape error — should be WHERE, not HAVING.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Status HAVING Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected HAVING-without-aggregation rejection")
+	}
+	if !strings.Contains(err.Error(), "HAVING") {
+		t.Errorf("error should mention HAVING: %v", err)
+	}
+}
+
+func TestExecSelectGroupByHavingBareGroupColumn(t *testing.T) {
+	// A bare column that IS in GROUP BY is fine in HAVING.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status HAVING Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tCOUNT(*)\nOpen\t3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestExecSelectDistinct(t *testing.T) {
 	// Fixture statuses: Open, Done, Open, Open → distinct {Open, Done}.
 	e, out, _ := newExec(t)

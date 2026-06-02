@@ -304,6 +304,46 @@ func bareColumn(e Expr) string {
 	return ""
 }
 
+// bareColumnNotIn returns the name of a column reference that appears
+// outside any AggregateExpr and is not in the allowed set, or "" if every
+// such reference is permitted. Used by GROUP BY validation: bare columns
+// must be one of the GROUP BY columns; aggregate arguments may reference
+// any column.
+func bareColumnNotIn(e Expr, allowed map[string]bool) string {
+	switch n := e.(type) {
+	case *ColumnExpr:
+		if allowed[n.Name] {
+			return ""
+		}
+		return n.Name
+	case *BinaryExpr:
+		if c := bareColumnNotIn(n.L, allowed); c != "" {
+			return c
+		}
+		return bareColumnNotIn(n.R, allowed)
+	case *AggregateExpr:
+		return ""
+	}
+	return ""
+}
+
+// collectAggregatesFromPredicate gathers aggregate nodes reachable from a
+// HAVING predicate. Comparison LHSes pass through collectAggregates;
+// NullTest/LIKE/IN/BETWEEN bind to bare column names directly and contribute
+// no aggregates.
+func collectAggregatesFromPredicate(p Predicate, out []*AggregateExpr) []*AggregateExpr {
+	switch n := p.(type) {
+	case *BinaryOp:
+		out = collectAggregatesFromPredicate(n.L, out)
+		return collectAggregatesFromPredicate(n.R, out)
+	case *NotOp:
+		return collectAggregatesFromPredicate(n.Inner, out)
+	case *Comparison:
+		return collectAggregates(n.LExpr, out)
+	}
+	return out
+}
+
 // collectAggregates walks the tree and appends each AggregateExpr to out.
 // Order is left-to-right, depth-first. Pointer identity defines slot
 // uniqueness — distinct AST nodes produce distinct slots even if they read
