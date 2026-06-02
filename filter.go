@@ -63,14 +63,7 @@ func ValidatePredicate(p Predicate, schema map[string]ColumnInfo) error {
 	case *NotOp:
 		return ValidatePredicate(n.Inner, schema)
 	case *Comparison:
-		col, ok := columnName(n.LExpr)
-		if !ok {
-			return fmt.Errorf("WHERE comparison LHS is not yet a supported expression in v2.0-alpha (parser-only release)")
-		}
-		if _, ok := schema[col]; !ok {
-			return fmt.Errorf("unknown column %q", col)
-		}
-		return nil
+		return validateExpr(n.LExpr, schema)
 	case *NullTest:
 		if _, ok := schema[n.Column]; !ok {
 			return fmt.Errorf("unknown column %q", n.Column)
@@ -289,24 +282,18 @@ func evalBetween(n *BetweenOp, row Row, ctx *EvalContext) (triVal, error) {
 }
 
 func evalComparison(c *Comparison, row Row, ctx *EvalContext) (triVal, error) {
-	col, ok := columnName(c.LExpr)
-	if !ok {
-		return triFalse, fmt.Errorf("WHERE comparison LHS is not yet a supported expression in v2.0-alpha (parser-only release)")
+	lhs, err := EvalExpr(c.LExpr, row, ctx)
+	if err != nil {
+		return triFalse, err
 	}
-	idx, ok := ctx.ColIdx[col]
-	if !ok {
-		return triFalse, fmt.Errorf("unknown column %q", col)
-	}
-	info := ctx.Schema[col]
-	cell := row[idx]
-	if cell.Null {
+	if lhs.Cell.Null {
 		return triUnknown, nil
 	}
-	lit, err := CoerceLiteral(c.Value, info.Type)
+	lit, err := CoerceLiteral(c.Value, lhs.Type)
 	if err != nil {
-		return triFalse, fmt.Errorf("WHERE %s %s: %w", col, c.Op, err)
+		return triFalse, fmt.Errorf("WHERE %s: %w", c.Op, err)
 	}
-	cmp := Compare(cell, lit, info.Type)
+	cmp := Compare(lhs.Cell, lit, lhs.Type)
 	switch c.Op {
 	case "=":
 		return boolTri(cmp == 0), nil
