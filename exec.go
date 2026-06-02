@@ -74,25 +74,40 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 		}
 	}
 
-	if len(sel.OrderBy) > 0 {
-		e.sortByKeys(matched, sel.OrderBy, ctx)
+	aggregated := false
+	for _, p := range plan {
+		if hasAggregate(p.Expr) {
+			aggregated = true
+			break
+		}
 	}
 
-	// Evaluate the projection per matched row before DISTINCT / LIMIT so
-	// dedup operates on the user-visible output values rather than raw
-	// source cells. SELECT DISTINCT price * 0 collapses across all rows.
-	projected := make([][]Cell, 0, len(matched))
-	for _, idx := range matched {
-		row := e.Table.Rows[idx]
-		out := make([]Cell, len(plan))
-		for i, p := range plan {
-			res, err := EvalExpr(p.Expr, row, ctx)
-			if err != nil {
-				return err
-			}
-			out[i] = res.Cell
+	var projected [][]Cell
+	if aggregated {
+		projected, err = e.evalImplicitAggregation(plan, matched, ctx)
+		if err != nil {
+			return err
 		}
-		projected = append(projected, out)
+	} else {
+		if len(sel.OrderBy) > 0 {
+			e.sortByKeys(matched, sel.OrderBy, ctx)
+		}
+		// Evaluate the projection per matched row before DISTINCT / LIMIT so
+		// dedup operates on the user-visible output values rather than raw
+		// source cells. SELECT DISTINCT price * 0 collapses across all rows.
+		projected = make([][]Cell, 0, len(matched))
+		for _, idx := range matched {
+			row := e.Table.Rows[idx]
+			out := make([]Cell, len(plan))
+			for i, p := range plan {
+				res, err := EvalExpr(p.Expr, row, ctx)
+				if err != nil {
+					return err
+				}
+				out[i] = res.Cell
+			}
+			projected = append(projected, out)
+		}
 	}
 
 	if sel.Distinct {
@@ -133,6 +148,53 @@ type projEntry struct {
 	Label string
 	Type  ColumnType
 	Expr  Expr
+}
+
+// evalImplicitAggregation handles SELECT with aggregates and no GROUP BY:
+// one slot per unique AggregateExpr pointer, advance once per matched row,
+// finalize, then evaluate each projection expression once with the slot
+// values injected via ctx.AggResults. The result is always exactly one
+// output row, even when no rows matched the WHERE — COUNT(*) returns 0 and
+// the other aggregates return NULL.
+func (e *Executor) evalImplicitAggregation(plan []projEntry, matched []int, ctx *EvalContext) ([][]Cell, error) {
+	slotByExpr := make(map[*AggregateExpr]*aggSlot)
+	var slots []*aggSlot
+	for _, p := range plan {
+		for _, a := range collectAggregates(p.Expr, nil) {
+			if _, ok := slotByExpr[a]; ok {
+				continue
+			}
+			s, err := newAggSlot(a, e.Table.Schema)
+			if err != nil {
+				return nil, err
+			}
+			slotByExpr[a] = s
+			slots = append(slots, s)
+		}
+	}
+	for _, idx := range matched {
+		row := e.Table.Rows[idx]
+		for _, s := range slots {
+			if err := s.advance(row, ctx); err != nil {
+				return nil, err
+			}
+		}
+	}
+	ctx.AggResults = make(map[*AggregateExpr]EvalCell, len(slots))
+	for a, s := range slotByExpr {
+		ctx.AggResults[a] = s.finalize()
+	}
+	out := make([]Cell, len(plan))
+	for i, p := range plan {
+		// The row arg is unused: aggregated projections cannot reach a bare
+		// column (planProjection rejected them), so EvalExpr never touches it.
+		res, err := EvalExpr(p.Expr, nil, ctx)
+		if err != nil {
+			return nil, err
+		}
+		out[i] = res.Cell
+	}
+	return [][]Cell{out}, nil
 }
 
 // applyOffsetLimitRows mirrors applyOffsetLimit but operates on projected
@@ -235,6 +297,11 @@ func compareForOrder(a, b Cell, t ColumnType) int {
 // expression's source-text rendering. Duplicate output labels are
 // rejected — the caller must alias to disambiguate, since the render
 // layer keys output rows by label.
+//
+// When any projection contains an aggregate, every bare column reference
+// must be wrapped in an aggregate (until slice 5 wires GROUP BY). Each
+// aggregate node is validated up front so SUM(Title) and friends fail at
+// plan time, before the row scan.
 func (e *Executor) planProjection(sel *SelectStmt) ([]projEntry, error) {
 	if sel.Star {
 		plan := make([]projEntry, len(e.Table.Columns))
@@ -247,14 +314,28 @@ func (e *Executor) planProjection(sel *SelectStmt) ([]projEntry, error) {
 		}
 		return plan, nil
 	}
+	anyAgg := false
+	for _, pr := range sel.Columns {
+		if hasAggregate(pr.Expr) {
+			anyAgg = true
+			break
+		}
+	}
 	plan := make([]projEntry, 0, len(sel.Columns))
 	seen := make(map[string]struct{}, len(sel.Columns))
 	for _, pr := range sel.Columns {
 		if err := validateExpr(pr.Expr, e.Table.Schema); err != nil {
 			return nil, err
 		}
-		if hasAggregate(pr.Expr) {
-			return nil, fmt.Errorf("aggregates parse in v2.0-alpha but executor support lands in v2.0")
+		if anyAgg {
+			if bare := bareColumn(pr.Expr); bare != "" {
+				return nil, fmt.Errorf("column %q must appear inside an aggregate or in GROUP BY", bare)
+			}
+			for _, a := range collectAggregates(pr.Expr, nil) {
+				if err := validateAggregate(a, e.Table.Schema); err != nil {
+					return nil, err
+				}
+			}
 		}
 		t, err := exprType(pr.Expr, e.Table.Schema)
 		if err != nil {

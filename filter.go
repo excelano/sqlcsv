@@ -19,9 +19,16 @@ const (
 // EvalContext bundles the per-table state evalPredicate needs. colIdx maps
 // column name to row position; schema carries inferred types. Built once per
 // statement and reused across rows.
+//
+// AggResults is populated only during the projection-eval phase of an
+// aggregated SELECT. Keyed by AggregateExpr pointer identity, it carries each
+// slot's finalized value so EvalExpr can substitute aggregates in arithmetic
+// like COUNT(*) + 1 or SUM(Price) / COUNT(*). Nil during the row-accumulation
+// scan and in non-aggregated queries.
 type EvalContext struct {
-	ColIdx map[string]int
-	Schema map[string]ColumnInfo
+	ColIdx     map[string]int
+	Schema     map[string]ColumnInfo
+	AggResults map[*AggregateExpr]EvalCell
 }
 
 // NewEvalContext constructs an EvalContext from a Table.

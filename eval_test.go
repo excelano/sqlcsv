@@ -177,12 +177,15 @@ func TestEvalExprTypeErrors(t *testing.T) {
 }
 
 func TestEvalExprAggregateRejected(t *testing.T) {
+	// Evaluating an aggregate without ctx.AggResults populated is the path
+	// taken outside an aggregation context (e.g. inside WHERE). It must
+	// surface a clear error, not silently produce zero.
 	_, err := EvalExpr(aggStar(), nil, nil)
 	if err == nil {
-		t.Fatal("aggregates should not evaluate in slice 1")
+		t.Fatal("aggregate outside aggregation context should error")
 	}
-	if !strings.Contains(err.Error(), "aggregates") {
-		t.Fatalf("error should mention aggregates: %v", err)
+	if !strings.Contains(err.Error(), "aggregate") {
+		t.Fatalf("error should mention aggregate: %v", err)
 	}
 }
 

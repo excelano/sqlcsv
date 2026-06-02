@@ -204,6 +204,228 @@ func TestExecSelectDistinctOverComputed(t *testing.T) {
 	}
 }
 
+func TestExecSelectCountStar(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "COUNT(*)\n4") {
+		t.Errorf("expected COUNT(*) = 4, got: %q", out.String())
+	}
+}
+
+func TestExecSelectCountColumnSkipsNull(t *testing.T) {
+	// Priority has 1 NULL row (Delta); COUNT(Priority) = 3.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(Priority)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "COUNT(Priority)\n3") {
+		t.Errorf("expected COUNT(Priority) = 3, got: %q", out.String())
+	}
+}
+
+func TestExecSelectSumAvgMinMax(t *testing.T) {
+	// Priority across rows: 3, 1, 5, NULL → sum=9, avg=3.0, min=1, max=5.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT SUM(Priority), AVG(Priority), MIN(Priority), MAX(Priority)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "SUM(Priority)\tAVG(Priority)\tMIN(Priority)\tMAX(Priority)\n9\t3\t1\t5"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectAggregateWithWhere(t *testing.T) {
+	// WHERE Status = 'Open' → rows 1, 3, 4. SUM(Priority) = 3+5 (NULL skipped) = 8.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*), SUM(Priority) WHERE Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "COUNT(*)\tSUM(Priority)\n3\t8"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectAggregateNoRows(t *testing.T) {
+	// WHERE matches nothing: COUNT(*) = 0; SUM, AVG, MIN, MAX = NULL (empty cell).
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*), SUM(Priority), AVG(Priority), MIN(Priority), MAX(Priority) WHERE Status = 'Closed'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	// Four NULL fields render as four trailing empty tabs.
+	want := "COUNT(*)\tSUM(Priority)\tAVG(Priority)\tMIN(Priority)\tMAX(Priority)\n0\t\t\t\t"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectAggregateInsideArithmetic(t *testing.T) {
+	// SUM(Priority) / COUNT(*) — full table: 9 / 4 = 2.25 (division promotes to float).
+	// COUNT(*) + 1 = 5.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) + 1 AS plus_one, SUM(Priority) / COUNT(*) AS ratio")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "plus_one\tratio\n5\t2.25"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectAggregateOverComputedArg(t *testing.T) {
+	// SUM(Priority * 10) over non-null priorities: 30 + 10 + 50 = 90.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT SUM(Priority * 10)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "90") {
+		t.Errorf("expected SUM(Priority*10) = 90: %q", out.String())
+	}
+}
+
+func TestExecSelectAggregateLabelAndAlias(t *testing.T) {
+	// Unaliased aggregate renders as source text; aliased uses the alias.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*), SUM(Priority) AS total")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(out.String(), "COUNT(*)\ttotal\n") {
+		t.Errorf("unexpected header: %q", out.String())
+	}
+}
+
+func TestExecSelectBareColumnWithAggregateRejected(t *testing.T) {
+	// SELECT Title, COUNT(*) without GROUP BY violates strict aggregation.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Title, COUNT(*)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected rejection of bare column mixed with aggregate")
+	}
+	if !strings.Contains(err.Error(), "Title") || !strings.Contains(err.Error(), "GROUP BY") {
+		t.Errorf("error should mention column and GROUP BY: %v", err)
+	}
+}
+
+func TestExecSelectSumOnStringRejected(t *testing.T) {
+	// SUM(Title) — string argument should fail at plan time.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT SUM(Title)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected SUM(Title) to be rejected")
+	}
+	if !strings.Contains(err.Error(), "numeric") {
+		t.Errorf("error should mention numeric requirement: %v", err)
+	}
+}
+
+func TestExecSelectMinMaxOverString(t *testing.T) {
+	// MIN/MAX work on any comparable type; Title is "Alpha" .. "Gamma".
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT MIN(Title), MAX(Title)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "MIN(Title)\tMAX(Title)\nAlpha\tGamma"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectAggregateInWhereRejected(t *testing.T) {
+	// WHERE COUNT(*) > 1 is meaningless; the executor surfaces an aggregate
+	// error when EvalExpr encounters AggregateExpr without slot context.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT * WHERE COUNT(*) > 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected aggregate-in-WHERE to error")
+	}
+	if !strings.Contains(err.Error(), "aggregate") {
+		t.Errorf("error should mention aggregate: %v", err)
+	}
+}
+
+func TestExecSelectAggregateFloatColumn(t *testing.T) {
+	// numericFixture has Discount as float with one NULL row: 0.1, 0.0, NULL, 0.5.
+	// SUM = 0.6; AVG = 0.6/3 surfaces the IEEE 754 short-repr (~0.2). The
+	// test pins the verbatim rendering so any future change to float
+	// formatting is caught.
+	tbl := numericFixture()
+	path := filepath.Join(t.TempDir(), "numeric.csv")
+	tbl.Path = path
+	if err := SaveCSV(tbl, ""); err != nil {
+		t.Fatal(err)
+	}
+	buf := &bytes.Buffer{}
+	e := &Executor{Table: tbl, Format: "tsv", Out: buf}
+	stmt, err := Parse("SELECT SUM(Discount), AVG(Discount)")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(buf.String(), "\n")
+	want := "SUM(Discount)\tAVG(Discount)\n0.6\t0.19999999999999998"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
 func TestExecSelectDistinct(t *testing.T) {
 	// Fixture statuses: Open, Done, Open, Open → distinct {Open, Done}.
 	e, out, _ := newExec(t)

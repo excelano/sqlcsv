@@ -32,7 +32,12 @@ func EvalExpr(e Expr, row Row, ctx *EvalContext) (EvalCell, error) {
 	case *BinaryExpr:
 		return evalBinary(n, row, ctx)
 	case *AggregateExpr:
-		return EvalCell{}, fmt.Errorf("aggregates parse in v2.0-alpha but executor support lands in v2.0")
+		if ctx != nil && ctx.AggResults != nil {
+			if v, ok := ctx.AggResults[n]; ok {
+				return v, nil
+			}
+		}
+		return EvalCell{}, fmt.Errorf("aggregate %s evaluated outside an aggregation context", n.Func)
 	}
 	return EvalCell{}, fmt.Errorf("internal: unhandled expression type %T", e)
 }
@@ -242,9 +247,29 @@ func exprType(e Expr, schema map[string]ColumnInfo) (ColumnType, error) {
 		}
 		return arithResultType(lt, rt, n.Op), nil
 	case *AggregateExpr:
-		return TypeString, fmt.Errorf("aggregates parse in v2.0-alpha but executor support lands in v2.0")
+		return aggregateOutputType(n, schema)
 	}
 	return TypeString, fmt.Errorf("internal: unhandled expression type %T", e)
+}
+
+// aggregateOutputType derives the static result type for an aggregate node.
+// COUNT is always int; AVG is always float; SUM/MIN/MAX inherit the static
+// type of the argument expression. The runtime path may promote SUM from int
+// to float on the first float input, but the static type used for projection
+// dedup keys and rendering tracks the argument's declared type.
+func aggregateOutputType(a *AggregateExpr, schema map[string]ColumnInfo) (ColumnType, error) {
+	if a.Star {
+		return TypeInt, nil
+	}
+	switch a.Func {
+	case "COUNT":
+		return TypeInt, nil
+	case "AVG":
+		return TypeFloat, nil
+	case "SUM", "MIN", "MAX":
+		return exprType(a.Arg, schema)
+	}
+	return TypeString, fmt.Errorf("internal: unknown aggregate %q", a.Func)
 }
 
 // hasAggregate reports whether the expression tree contains an aggregate
@@ -258,6 +283,196 @@ func hasAggregate(e Expr) bool {
 		return hasAggregate(n.L) || hasAggregate(n.R)
 	}
 	return false
+}
+
+// bareColumn returns the name of a ColumnExpr that appears outside any
+// AggregateExpr in the tree, or "" if every column reference is wrapped in
+// an aggregate. Used to reject `SELECT Title, COUNT(*)` when no GROUP BY is
+// in play — Postgres-strict semantics per Pass 2 decisions.
+func bareColumn(e Expr) string {
+	switch n := e.(type) {
+	case *ColumnExpr:
+		return n.Name
+	case *BinaryExpr:
+		if c := bareColumn(n.L); c != "" {
+			return c
+		}
+		return bareColumn(n.R)
+	case *AggregateExpr:
+		return ""
+	}
+	return ""
+}
+
+// collectAggregates walks the tree and appends each AggregateExpr to out.
+// Order is left-to-right, depth-first. Pointer identity defines slot
+// uniqueness — distinct AST nodes produce distinct slots even if they read
+// the same column. Nested aggregates are rejected at validate time, so this
+// walker never recurses through an AggregateExpr's Arg.
+func collectAggregates(e Expr, out []*AggregateExpr) []*AggregateExpr {
+	switch n := e.(type) {
+	case *AggregateExpr:
+		return append(out, n)
+	case *BinaryExpr:
+		out = collectAggregates(n.L, out)
+		return collectAggregates(n.R, out)
+	}
+	return out
+}
+
+// validateAggregate checks an AggregateExpr is well-formed: the function is
+// known, COUNT is the only one that accepts *, the argument validates
+// against the schema, no nested aggregates, and SUM/AVG arguments are
+// numeric. MIN/MAX accept any comparable type; runtime Compare handles the
+// type-specific path.
+func validateAggregate(a *AggregateExpr, schema map[string]ColumnInfo) error {
+	switch a.Func {
+	case "COUNT", "SUM", "AVG", "MIN", "MAX":
+	default:
+		return fmt.Errorf("unknown aggregate function %q", a.Func)
+	}
+	if a.Star {
+		if a.Func != "COUNT" {
+			return fmt.Errorf("%s(*) is not valid; only COUNT(*) is supported", a.Func)
+		}
+		return nil
+	}
+	if err := validateExpr(a.Arg, schema); err != nil {
+		return err
+	}
+	if hasAggregate(a.Arg) {
+		return fmt.Errorf("%s: nested aggregates are not allowed", a.Func)
+	}
+	argT, err := exprType(a.Arg, schema)
+	if err != nil {
+		return err
+	}
+	if a.Func == "SUM" || a.Func == "AVG" {
+		if argT != TypeInt && argT != TypeFloat {
+			return fmt.Errorf("%s requires a numeric argument, got %s", a.Func, argT)
+		}
+	}
+	return nil
+}
+
+// aggSlot is the per-aggregate accumulator. One slot per unique AggregateExpr
+// in the projection plan; advance(row) consumes one input row, finalize()
+// produces the aggregated result. The state union is wide enough to cover
+// every function — each one reads only the fields its semantics require.
+type aggSlot struct {
+	Expr    *AggregateExpr
+	ArgType ColumnType
+
+	count      int64
+	sumInt     int64
+	sumFloat   float64
+	sumIsInt   bool
+	minMaxCell Cell
+	hasValue   bool
+}
+
+// newAggSlot builds a slot for an aggregate node. ArgType is the static type
+// of the argument expression (used for MIN/MAX comparison and the static
+// output type of SUM/MIN/MAX); COUNT(*) carries TypeInt as a placeholder.
+// sumIsInt starts true; the first float-typed value flips it and converts
+// any int sum collected so far into the float accumulator.
+func newAggSlot(a *AggregateExpr, schema map[string]ColumnInfo) (*aggSlot, error) {
+	s := &aggSlot{Expr: a, sumIsInt: true, ArgType: TypeInt}
+	if !a.Star {
+		t, err := exprType(a.Arg, schema)
+		if err != nil {
+			return nil, err
+		}
+		s.ArgType = t
+	}
+	return s, nil
+}
+
+// advance folds one row into the accumulator. COUNT(*) counts unconditionally;
+// every other function evaluates the argument expression and skips NULL,
+// matching standard SQL aggregate NULL semantics.
+func (s *aggSlot) advance(row Row, ctx *EvalContext) error {
+	if s.Expr.Star {
+		s.count++
+		return nil
+	}
+	v, err := EvalExpr(s.Expr.Arg, row, ctx)
+	if err != nil {
+		return err
+	}
+	if v.Cell.Null {
+		return nil
+	}
+	switch s.Expr.Func {
+	case "COUNT":
+		s.count++
+	case "SUM":
+		s.hasValue = true
+		s.count++
+		if v.Type == TypeFloat {
+			if s.sumIsInt {
+				s.sumFloat = float64(s.sumInt)
+				s.sumIsInt = false
+			}
+			s.sumFloat += v.Cell.Float
+		} else {
+			if s.sumIsInt {
+				s.sumInt += v.Cell.Int
+			} else {
+				s.sumFloat += float64(v.Cell.Int)
+			}
+		}
+	case "AVG":
+		s.hasValue = true
+		s.count++
+		if v.Type == TypeFloat {
+			s.sumFloat += v.Cell.Float
+		} else {
+			s.sumFloat += float64(v.Cell.Int)
+		}
+	case "MIN":
+		if !s.hasValue || Compare(v.Cell, s.minMaxCell, s.ArgType) < 0 {
+			s.minMaxCell = v.Cell
+			s.hasValue = true
+		}
+	case "MAX":
+		if !s.hasValue || Compare(v.Cell, s.minMaxCell, s.ArgType) > 0 {
+			s.minMaxCell = v.Cell
+			s.hasValue = true
+		}
+	}
+	return nil
+}
+
+// finalize closes the accumulator and yields the EvalCell that represents
+// this aggregate's value for the output row. COUNT always produces an
+// integer (0 over an empty set). SUM/AVG/MIN/MAX produce NULL over an empty
+// or all-NULL set; their static type is preserved so projection rendering
+// stays consistent.
+func (s *aggSlot) finalize() EvalCell {
+	switch s.Expr.Func {
+	case "COUNT":
+		return EvalCell{Cell: Cell{Int: s.count}, Type: TypeInt}
+	case "SUM":
+		if !s.hasValue {
+			return EvalCell{Cell: Cell{Null: true}, Type: s.ArgType}
+		}
+		if s.sumIsInt {
+			return EvalCell{Cell: Cell{Int: s.sumInt}, Type: TypeInt}
+		}
+		return EvalCell{Cell: Cell{Float: s.sumFloat}, Type: TypeFloat}
+	case "AVG":
+		if !s.hasValue {
+			return EvalCell{Cell: Cell{Null: true}, Type: TypeFloat}
+		}
+		return EvalCell{Cell: Cell{Float: s.sumFloat / float64(s.count)}, Type: TypeFloat}
+	case "MIN", "MAX":
+		if !s.hasValue {
+			return EvalCell{Cell: Cell{Null: true}, Type: s.ArgType}
+		}
+		return EvalCell{Cell: s.minMaxCell, Type: s.ArgType}
+	}
+	return EvalCell{Cell: Cell{Null: true}, Type: TypeString}
 }
 
 // validateExpr walks an expression tree and rejects column references that
