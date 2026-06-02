@@ -418,6 +418,172 @@ func TestExecUpdateCommit(t *testing.T) {
 	}
 }
 
+func TestExecUpdateComputed(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = Priority + 10 WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, true); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if got := e.Table.Rows[0][3].Int; got != 13 {
+		t.Errorf("row 0 Priority = %d, want 13 (was 3 + 10)", got)
+	}
+	if got := e.Table.Rows[1][3].Int; got != 1 {
+		t.Errorf("row 1 Priority = %d, want unchanged 1", got)
+	}
+}
+
+func TestExecUpdateComputedAcrossRows(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = Priority * 2 WHERE Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, true); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Rows 1, 3, 4 are Open. Row 4 has Priority=NULL → stays NULL.
+	// Row 1: 3 → 6. Row 3: 5 → 10. Row 2 (Done): unchanged at 1.
+	wants := []struct {
+		idx  int
+		want int64
+		null bool
+	}{
+		{0, 6, false},
+		{1, 1, false},
+		{2, 10, false},
+		{3, 0, true},
+	}
+	for _, w := range wants {
+		cell := e.Table.Rows[w.idx][3]
+		if cell.Null != w.null {
+			t.Errorf("row %d: null=%v, want %v", w.idx, cell.Null, w.null)
+		}
+		if !w.null && cell.Int != w.want {
+			t.Errorf("row %d: Priority=%d, want %d", w.idx, cell.Int, w.want)
+		}
+	}
+}
+
+func TestExecUpdateComputedNullPropagates(t *testing.T) {
+	e, _, _ := newExec(t)
+	// Row 4 has Priority=NULL. Adding 1 keeps it NULL — does not crash, does
+	// not coerce.
+	stmt, err := Parse("UPDATE SET Priority = Priority + 1 WHERE ID = 4")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, true); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !e.Table.Rows[3][3].Null {
+		t.Errorf("row 3 (ID=4) Priority should remain NULL, got %+v", e.Table.Rows[3][3])
+	}
+}
+
+func TestExecUpdateComputedPreviewShowsExpression(t *testing.T) {
+	e, buf, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = Priority + 1 WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	if !strings.Contains(buf.String(), "SET Priority = Priority + 1") {
+		t.Errorf("preview should reflect source expression: %q", buf.String())
+	}
+}
+
+func TestExecUpdateComputedSwapSemantics(t *testing.T) {
+	// Standard SQL: every SET RHS evaluates against the pre-update row.
+	// SET a = b, b = a should swap; using the new value of `a` for `b` would
+	// leave both columns equal to the old `b`.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET ID = Priority, Priority = ID WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, true); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Row 0 originally: ID=1, Priority=3. After swap: ID=3, Priority=1.
+	if e.Table.Rows[0][0].Int != 3 {
+		t.Errorf("ID = %d, want 3 (swap)", e.Table.Rows[0][0].Int)
+	}
+	if e.Table.Rows[0][3].Int != 1 {
+		t.Errorf("Priority = %d, want 1 (swap)", e.Table.Rows[0][3].Int)
+	}
+}
+
+func TestExecUpdateUnknownColumnInExpression(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = Nope + 1 WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, true)
+	if err == nil {
+		t.Fatal("expected error for unknown column in SET expression")
+	}
+	if !strings.Contains(err.Error(), "Nope") {
+		t.Errorf("error should mention column name: %v", err)
+	}
+}
+
+func TestExecUpdateAggregateInSetRejected(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = COUNT(*) WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, true)
+	if err == nil {
+		t.Fatal("aggregates in SET should be rejected")
+	}
+	if !strings.Contains(err.Error(), "aggregate") {
+		t.Errorf("error should mention aggregate: %v", err)
+	}
+}
+
+func TestExecUpdateComputedFloatIntoIntRejected(t *testing.T) {
+	// 3 / 2 = 1.5 in v2 (/ always promotes to float). Storing 1.5 into an
+	// int column has no lossless representation, so coerceEvalCell should
+	// reject. SET Priority = 3 / 2 WHERE ID = 1 exercises that path.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("UPDATE SET Priority = 3 / 2 WHERE ID = 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, true)
+	if err == nil {
+		t.Fatal("float result into int column should error")
+	}
+}
+
+func TestExecUpdateLiteralStillWorks(t *testing.T) {
+	// Slice 2 should not regress the v1 literal-SET path.
+	e, _, path := newExec(t)
+	stmt, err := Parse("UPDATE SET Status = 'Done' WHERE Status = 'Open'")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, true); err != nil {
+		t.Fatal(err)
+	}
+	reloaded, err := LoadCSV(path, LoadOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	for i, row := range reloaded.Rows {
+		if row[2].Str != "Done" {
+			t.Errorf("row %d: Status %q, want Done", i, row[2].Str)
+		}
+	}
+}
+
 func TestExecDeleteWithWhere(t *testing.T) {
 	e, _, path := newExec(t)
 	stmt, err := Parse("DELETE WHERE Status = 'Done'")

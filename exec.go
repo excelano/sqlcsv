@@ -232,8 +232,7 @@ func (e *Executor) executeUpdate(upd *UpdateStmt, commit bool) error {
 	if err := ValidatePredicate(upd.Where, e.Table.Schema); err != nil {
 		return err
 	}
-	cells, err := e.buildAssignmentCells(upd.Assignments)
-	if err != nil {
+	if err := e.validateAssignments(upd.Assignments); err != nil {
 		return err
 	}
 
@@ -258,16 +257,52 @@ func (e *Executor) executeUpdate(upd *UpdateStmt, commit bool) error {
 	if len(matches) == 0 {
 		return e.flush()
 	}
+
+	ctx := NewEvalContext(e.Table)
 	for _, idx := range matches {
+		row := e.Table.Rows[idx]
+		// Standard SQL UPDATE semantics: every SET RHS evaluates against the
+		// pre-update row, so SET a = b, b = a swaps without using the new
+		// value of a. Stage the new cells first, then write them all at once.
+		newCells := make(map[string]Cell, len(upd.Assignments))
 		for _, a := range upd.Assignments {
-			ci := e.colIndex(a.Column)
-			e.Table.Rows[idx][ci] = cells[a.Column]
+			info := e.Table.Schema[a.Column]
+			result, err := EvalExpr(a.Value, row, ctx)
+			if err != nil {
+				return fmt.Errorf("UPDATE column %q: %w", a.Column, err)
+			}
+			cell, err := coerceEvalCell(result, info.Type, a.Column)
+			if err != nil {
+				return err
+			}
+			newCells[a.Column] = cell
+		}
+		for col, cell := range newCells {
+			row[e.colIndex(col)] = cell
 		}
 	}
 	if err := e.flush(); err != nil {
 		return err
 	}
 	fmt.Fprintf(e.Out, "Updated %d of %d row%s. Wrote %s.\n", len(matches), len(matches), plural(len(matches)), e.targetPath())
+	return nil
+}
+
+// validateAssignments checks each SET target column exists, each RHS
+// expression references known columns only, and no aggregate slips into
+// SET (aggregates are meaningful only in projection / HAVING contexts).
+func (e *Executor) validateAssignments(assigns []Assignment) error {
+	for _, a := range assigns {
+		if _, ok := e.Table.Schema[a.Column]; !ok {
+			return fmt.Errorf("unknown column %q", a.Column)
+		}
+		if err := validateExpr(a.Value, e.Table.Schema); err != nil {
+			return err
+		}
+		if hasAggregate(a.Value) {
+			return fmt.Errorf("column %q: aggregates are not allowed in SET", a.Column)
+		}
+	}
 	return nil
 }
 
@@ -396,6 +431,11 @@ func (e *Executor) findMatches(where Predicate) ([]int, error) {
 	return out, nil
 }
 
+// buildAssignmentCells is the INSERT-side helper for evaluating literal
+// assignments once and reusing the result. UPDATE uses a per-row eval path
+// in executeUpdate because computed RHSes depend on the source row. Only
+// LiteralExpr is reachable here because executeInsert wraps each input
+// Value in a LiteralExpr before calling.
 func (e *Executor) buildAssignmentCells(assigns []Assignment) (map[string]Cell, error) {
 	cells := make(map[string]Cell, len(assigns))
 	for _, a := range assigns {
@@ -405,7 +445,7 @@ func (e *Executor) buildAssignmentCells(assigns []Assignment) (map[string]Cell, 
 		}
 		lit, ok := a.Value.(*LiteralExpr)
 		if !ok {
-			return nil, fmt.Errorf("column %q: computed assignments parse in v2.0-alpha but executor support lands in v2.0", a.Column)
+			return nil, fmt.Errorf("internal: INSERT requires literal values")
 		}
 		c, err := CoerceLiteral(lit.Value, info.Type)
 		if err != nil {
@@ -517,12 +557,42 @@ func findValue(ins *InsertStmt, c string) Value {
 	return Value{Kind: ValNull}
 }
 
-// renderExpr is the preview-friendly form of an assignment RHS. In
-// v2.0-alpha the executor only commits LiteralExpr assignments, so by the
-// time the preview prints, anything richer has already been rejected.
+// renderExpr formats an expression as readable SQL text for write previews.
+// Binary children are parenthesized when their op has lower precedence than
+// the parent, so the preview reflects user intent even after the parser
+// flattens precedence into the tree shape.
 func renderExpr(e Expr) string {
-	if lit, ok := e.(*LiteralExpr); ok {
-		return renderLiteral(lit.Value)
+	return renderExprPrec(e, 0)
+}
+
+func renderExprPrec(e Expr, parentPrec int) string {
+	switch n := e.(type) {
+	case *LiteralExpr:
+		return renderLiteral(n.Value)
+	case *ColumnExpr:
+		return n.Name
+	case *BinaryExpr:
+		prec := opPrec(n.Op)
+		s := renderExprPrec(n.L, prec) + " " + n.Op + " " + renderExprPrec(n.R, prec)
+		if prec < parentPrec {
+			s = "(" + s + ")"
+		}
+		return s
+	case *AggregateExpr:
+		if n.Star {
+			return n.Func + "(*)"
+		}
+		return n.Func + "(" + renderExpr(n.Arg) + ")"
 	}
-	return "<expr>"
+	return "?"
+}
+
+func opPrec(op string) int {
+	switch op {
+	case "+", "-":
+		return 1
+	case "*", "/":
+		return 2
+	}
+	return 0
 }

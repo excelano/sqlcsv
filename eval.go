@@ -4,6 +4,7 @@ import (
 	"fmt"
 	"strconv"
 	"strings"
+	"time"
 )
 
 // EvalCell is the typed result of evaluating an Expr against a row. The Cell
@@ -157,6 +158,63 @@ func arithResultType(l, r ColumnType, op string) ColumnType {
 		return TypeInt
 	}
 	return TypeFloat
+}
+
+// coerceEvalCell converts an expression result to a Cell suitable for storage
+// in a column of the given target type. NULL passes through. Same-type results
+// copy directly. Cross-type results route through CoerceLiteral so the rules
+// match literal coercion in INSERT/UPDATE — string↔number, bool↔string, etc.
+// behave identically. Float→int succeeds only when the float value is exactly
+// representable as an integer; partial values surface as coercion errors
+// rather than silently truncating.
+func coerceEvalCell(e EvalCell, target ColumnType, colName string) (Cell, error) {
+	if e.Cell.Null {
+		return Cell{Null: true}, nil
+	}
+	if e.Type == target {
+		return e.Cell, nil
+	}
+	cell, err := CoerceLiteral(evalCellAsValue(e), target)
+	if err != nil {
+		return Cell{}, fmt.Errorf("column %q: %w", colName, err)
+	}
+	return cell, nil
+}
+
+// evalCellAsValue formats a non-NULL EvalCell as a parser-shaped Value so it
+// can be coerced via the shared CoerceLiteral path. Float formatting uses
+// the shortest round-trippable representation; date formatting uses RFC3339
+// because CoerceLiteral parses dates from ISO 8601 strings.
+func evalCellAsValue(e EvalCell) Value {
+	if e.Cell.Null {
+		return Value{Kind: ValNull}
+	}
+	switch e.Type {
+	case TypeInt:
+		return Value{Kind: ValNumber, Num: strconv.FormatInt(e.Cell.Int, 10)}
+	case TypeFloat:
+		return Value{Kind: ValNumber, Num: strconv.FormatFloat(e.Cell.Float, 'g', -1, 64)}
+	case TypeBool:
+		return Value{Kind: ValBool, Bool: e.Cell.Bool}
+	case TypeString:
+		return Value{Kind: ValString, Str: e.Cell.Str}
+	case TypeDate:
+		return Value{Kind: ValString, Str: e.Cell.Date.Format(time.RFC3339)}
+	}
+	return Value{Kind: ValNull}
+}
+
+// hasAggregate reports whether the expression tree contains an aggregate
+// node. UPDATE SET and WHERE forbid aggregates; SELECT projection and
+// HAVING permit them.
+func hasAggregate(e Expr) bool {
+	switch n := e.(type) {
+	case *AggregateExpr:
+		return true
+	case *BinaryExpr:
+		return hasAggregate(n.L) || hasAggregate(n.R)
+	}
+	return false
 }
 
 // validateExpr walks an expression tree and rejects column references that
