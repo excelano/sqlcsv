@@ -18,6 +18,11 @@ func not(p Predicate) *NotOp                { return &NotOp{Inner: p} }
 func iptr(n int) *int                       { return &n }
 func asc(c string) OrderKey                 { return OrderKey{Column: c} }
 func desc(c string) OrderKey                { return OrderKey{Column: c, Desc: true} }
+func like(c, p string, n bool) *LikeOp      { return &LikeOp{Column: c, Pattern: p, Not: n} }
+func in(c string, vs []Value, n bool) *InOp { return &InOp{Column: c, Values: vs, Not: n} }
+func between(c string, lo, hi Value, n bool) *BetweenOp {
+	return &BetweenOp{Column: c, Low: lo, High: hi, Not: n}
+}
 
 func TestParse(t *testing.T) {
 	tests := []struct {
@@ -161,6 +166,108 @@ func TestParse(t *testing.T) {
 			name:    "offset rejects float",
 			input:   "SELECT * OFFSET 0.5",
 			wantErr: "integer",
+		},
+
+		// LIKE
+		{
+			name:  "like prefix",
+			input: "SELECT * WHERE Title LIKE 'foo%'",
+			want:  &SelectStmt{Star: true, Where: like("Title", "foo%", false)},
+		},
+		{
+			name:  "like with underscore wildcard",
+			input: "SELECT * WHERE Title LIKE 'a_b'",
+			want:  &SelectStmt{Star: true, Where: like("Title", "a_b", false)},
+		},
+		{
+			name:  "not like",
+			input: "SELECT * WHERE Title NOT LIKE '%spam%'",
+			want:  &SelectStmt{Star: true, Where: like("Title", "%spam%", true)},
+		},
+		{
+			name:    "like rejects bare number",
+			input:   "SELECT * WHERE Title LIKE 42",
+			wantErr: "string pattern",
+		},
+
+		// IN
+		{
+			name: "in single value",
+			input: "SELECT * WHERE Status IN ('Open')",
+			want: &SelectStmt{Star: true, Where: in("Status", []Value{vstr("Open")}, false)},
+		},
+		{
+			name: "in multiple values",
+			input: "SELECT * WHERE Status IN ('Open', 'In Progress', 'Done')",
+			want: &SelectStmt{Star: true, Where: in("Status",
+				[]Value{vstr("Open"), vstr("In Progress"), vstr("Done")}, false)},
+		},
+		{
+			name: "in numbers",
+			input: "SELECT * WHERE Priority IN (1, 2, 3)",
+			want: &SelectStmt{Star: true, Where: in("Priority",
+				[]Value{vnum("1"), vnum("2"), vnum("3")}, false)},
+		},
+		{
+			name: "not in",
+			input: "SELECT * WHERE Status NOT IN ('Archived', 'Cancelled')",
+			want: &SelectStmt{Star: true, Where: in("Status",
+				[]Value{vstr("Archived"), vstr("Cancelled")}, true)},
+		},
+		{
+			name:    "in rejects empty list",
+			input:   "SELECT * WHERE Status IN ()",
+			wantErr: "at least one value",
+		},
+
+		// BETWEEN
+		{
+			name:  "between numbers",
+			input: "SELECT * WHERE Priority BETWEEN 1 AND 5",
+			want:  &SelectStmt{Star: true, Where: between("Priority", vnum("1"), vnum("5"), false)},
+		},
+		{
+			name:  "not between",
+			input: "SELECT * WHERE Priority NOT BETWEEN 1 AND 3",
+			want:  &SelectStmt{Star: true, Where: between("Priority", vnum("1"), vnum("3"), true)},
+		},
+		{
+			name:  "between dates",
+			input: "SELECT * WHERE Modified BETWEEN '2024-01-01' AND '2024-12-31'",
+			want:  &SelectStmt{Star: true, Where: between("Modified", vstr("2024-01-01"), vstr("2024-12-31"), false)},
+		},
+		{
+			name:    "between requires AND",
+			input:   "SELECT * WHERE Priority BETWEEN 1, 5",
+			wantErr: "AND",
+		},
+		{
+			name:    "between rejects null bound",
+			input:   "SELECT * WHERE Priority BETWEEN NULL AND 5",
+			wantErr: "NULL",
+		},
+		{
+			name:    "postfix NOT requires LIKE/IN/BETWEEN",
+			input:   "SELECT * WHERE Title NOT = 'foo'",
+			wantErr: "NOT",
+		},
+
+		// Combinations with AND/OR
+		{
+			name: "between inside and",
+			input: "SELECT * WHERE Priority BETWEEN 1 AND 5 AND Status = 'Open'",
+			want: &SelectStmt{Star: true, Where: and(
+				between("Priority", vnum("1"), vnum("5"), false),
+				cmp("Status", "=", vstr("Open")),
+			)},
+		},
+		{
+			name: "like and in",
+			input: "SELECT * WHERE Title LIKE 'Fix%' AND Status IN ('Open', 'Done')",
+			want: &SelectStmt{Star: true, Where: and(
+				like("Title", "Fix%", false),
+				in("Status", []Value{vstr("Open"), vstr("Done")}, false),
+			)},
 		},
 
 		// SELECT with WHERE: comparison operators

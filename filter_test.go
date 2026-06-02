@@ -177,6 +177,144 @@ func TestMatchesThreeValuedLogic(t *testing.T) {
 	}
 }
 
+func TestMatchesLike(t *testing.T) {
+	// Fixture titles: Alpha, Beta, Gamma, Delta.
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	cases := []struct {
+		name    string
+		pred    Predicate
+		wantIDs []int64
+	}{
+		{"prefix wildcard", like("Title", "A%", false), []int64{1}},
+		{"suffix wildcard", like("Title", "%a", false), []int64{1, 2, 3, 4}}, // all end with 'a'
+		{"contains wildcard", like("Title", "%et%", false), []int64{2}},
+		{"single-char wildcard", like("Title", "_eta", false), []int64{2}},
+		{"literal escape", like("Title", `\%`, false), []int64{}},
+		{"not like prefix", like("Title", "A%", true), []int64{2, 3, 4}},
+		{"no match", like("Title", "Zzz%", false), []int64{}},
+		{"exact equal via empty wildcards", like("Title", "Alpha", false), []int64{1}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := matchingIDs(t, tbl, ctx, tc.pred)
+			if !equalIDs(ids, tc.wantIDs) {
+				t.Fatalf("got %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestMatchesLikeRejectsNonString(t *testing.T) {
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	_, err := Matches(like("Priority", "1%", false), tbl.Rows[0], ctx)
+	if err == nil {
+		t.Fatal("LIKE on int column should error")
+	}
+	if !strings.Contains(err.Error(), "string columns") {
+		t.Fatalf("error should explain why: %v", err)
+	}
+}
+
+func TestMatchesIn(t *testing.T) {
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	cases := []struct {
+		name    string
+		pred    Predicate
+		wantIDs []int64
+	}{
+		{"int in", in("Priority", []Value{vnum("1"), vnum("5")}, false), []int64{2, 3}},
+		{"string in", in("Status", []Value{vstr("Open"), vstr("Done")}, false), []int64{1, 2, 3, 4}},
+		{"single value", in("Status", []Value{vstr("Done")}, false), []int64{2}},
+		{"no match", in("Status", []Value{vstr("Archived")}, false), []int64{}},
+		{"not in", in("Status", []Value{vstr("Done")}, true), []int64{1, 3, 4}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := matchingIDs(t, tbl, ctx, tc.pred)
+			if !equalIDs(ids, tc.wantIDs) {
+				t.Fatalf("got %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestMatchesInExcludesNullCell(t *testing.T) {
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	// Row 4 has Priority=NULL. IN with any list should not pick it up.
+	ids := matchingIDs(t, tbl, ctx, in("Priority", []Value{vnum("3")}, false))
+	for _, id := range ids {
+		if id == 4 {
+			t.Fatal("row 4 (Priority=NULL) leaked into IN result")
+		}
+	}
+	// NOT IN also excludes (UNKNOWN stays UNKNOWN).
+	ids = matchingIDs(t, tbl, ctx, in("Priority", []Value{vnum("99")}, true))
+	for _, id := range ids {
+		if id == 4 {
+			t.Fatal("row 4 (Priority=NULL) leaked into NOT IN result")
+		}
+	}
+}
+
+func TestMatchesBetween(t *testing.T) {
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	cases := []struct {
+		name    string
+		pred    Predicate
+		wantIDs []int64
+	}{
+		{"int between inclusive", between("Priority", vnum("1"), vnum("3"), false), []int64{1, 2}},
+		{"int between single match", between("Priority", vnum("5"), vnum("5"), false), []int64{3}},
+		{"int between no match", between("Priority", vnum("10"), vnum("20"), false), []int64{}},
+		{"int not between", between("Priority", vnum("2"), vnum("4"), true), []int64{2, 3}},
+		{"date between", between("Modified", vstr("2024-01-01"), vstr("2024-06-30"), false), []int64{1, 4}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := matchingIDs(t, tbl, ctx, tc.pred)
+			if !equalIDs(ids, tc.wantIDs) {
+				t.Fatalf("got %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
+func TestLikeMatcher(t *testing.T) {
+	cases := []struct {
+		pattern, s string
+		want       bool
+	}{
+		{"abc", "abc", true},
+		{"abc", "abcd", false},
+		{"a%", "abc", true},
+		{"a%", "a", true},
+		{"%c", "abc", true},
+		{"%b%", "abc", true},
+		{"_b_", "abc", true},
+		{"_b_", "ab", false},
+		{`\%`, "%", true},
+		{`\_`, "_", true},
+		{`\%`, "x", false},
+		{"a%c", "abbbbc", true},
+		{"a%c", "ac", true},
+		{"a%c", "ab", false},
+		{"", "", true},
+		{"%", "", true},
+		{"%", "anything", true},
+	}
+	for _, tc := range cases {
+		got := likeMatch(tc.pattern, tc.s)
+		if got != tc.want {
+			t.Errorf("likeMatch(%q, %q) = %v, want %v", tc.pattern, tc.s, got, tc.want)
+		}
+	}
+}
+
 func TestValidatePredicate(t *testing.T) {
 	tbl := fixtureTable()
 	err := ValidatePredicate(cmp("Nope", "=", vstr("x")), tbl.Schema)

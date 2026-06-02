@@ -56,11 +56,14 @@ predicate     := disjunction
 disjunction   := conjunction ( "OR" conjunction )*
 conjunction   := negation ( "AND" negation )*
 negation      := "NOT" negation | atom
-atom          := comparison | null_test | "(" predicate ")"
+atom          := comparison | null_test | like_test | in_test | between_test | "(" predicate ")"
 
 comparison    := column op value
 op            := "=" | "!=" | "<" | ">" | "<=" | ">="
 null_test     := column "IS" "NOT"? "NULL"
+like_test     := column "NOT"? "LIKE" string
+in_test       := column "NOT"? "IN" "(" value ( "," value )* ")"
+between_test  := column "NOT"? "BETWEEN" value "AND" value
 ```
 
 Operator precedence, from lowest to highest, is `OR`, `AND`, `NOT`. `NOT` is right-associative. Parentheses override precedence.
@@ -92,6 +95,12 @@ String literals are coerced to the destination column's inferred type at executi
 
 Empty CSV cells are treated as `NULL` for the purposes of `IS NULL` and `IS NOT NULL`. Only those tests work on `NULL`; `col = NULL` is a parse error, since `=` with `NULL` is always undefined in SQL.
 
+`LIKE` matches a string column against a pattern. `%` matches zero or more characters; `_` matches exactly one. A backslash escapes the next character (`\%` matches a literal `%`, `\_` a literal `_`). LIKE only works on string columns; running it against a numeric, date, or boolean column is a clear error rather than a silent coercion. `NOT LIKE` negates the match. A NULL cell makes the result UNKNOWN, which excludes the row, matching standard SQL.
+
+`IN` tests for set membership: `col IN (v1, v2, v3)`. The value list must be non-empty and must contain only literals — sub-queries are not supported. Values are coerced to the column's type, so `Priority IN (1, 2, 3)` works against an integer column and `Status IN ('Open', 'Done')` against a string column. `NOT IN` negates the match. NULL on the column side excludes the row; NULL inside the list is a parse error.
+
+`BETWEEN` is inclusive on both bounds: `col BETWEEN low AND high` is equivalent to `col >= low AND col <= high`. Bounds must be literal values, not NULL, and are coerced to the column's type. `NOT BETWEEN` negates the match. NULL on the column side excludes the row.
+
 Statements are terminated by end of input. A trailing semicolon is accepted but not required.
 
 ## REPL pre-processing
@@ -120,6 +129,12 @@ SELECT Title WHERE Status = 'Open' AND Priority > 2
 SELECT Title WHERE (Status = 'Open' OR Status = 'In Review') AND NOT Archived = TRUE
 SELECT Title WHERE DueDate IS NULL
 SELECT Title WHERE DueDate IS NOT NULL AND Modified < '2024-01-01'
+SELECT Title WHERE Title LIKE 'Fix%'
+SELECT Title WHERE Title NOT LIKE '%draft%'
+SELECT Title WHERE Status IN ('Open', 'In Progress')
+SELECT Title WHERE Priority NOT IN (4, 5)
+SELECT Title WHERE Priority BETWEEN 1 AND 3
+SELECT Title WHERE Modified BETWEEN '2024-01-01' AND '2024-06-30'
 
 UPDATE SET Status = 'Done' WHERE ID = 42
 UPDATE SET Status = 'Done', Priority = 1 WHERE Status = 'Open'
@@ -139,7 +154,7 @@ The grammar deliberately excludes most of SQL. Each excluded construct produces 
 
 Permanently out of scope: `JOIN` of any form. sqlcsv operates on a single file per session by design. To combine data across files, run a SELECT against each, redirect to a new CSV, and load it.
 
-Planned for v1.1: `LIKE` for substring matching, `IN` for set membership, and `BETWEEN` for range tests.
+The v1 grammar is now feature-complete relative to the original v1.x scope.
 
 Planned for v2, requiring extra work: aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, `HAVING`, and computed assignments like `SET col = col + 1`.
 

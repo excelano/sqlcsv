@@ -63,6 +63,9 @@ func (*BinaryOp) predicate()   {}
 func (*NotOp) predicate()      {}
 func (*Comparison) predicate() {}
 func (*NullTest) predicate()   {}
+func (*LikeOp) predicate()     {}
+func (*InOp) predicate()       {}
+func (*BetweenOp) predicate()  {}
 
 // BinaryOp is "AND" or "OR".
 type BinaryOp struct {
@@ -85,6 +88,33 @@ type Comparison struct {
 // NullTest: column IS [NOT] NULL.
 type NullTest struct {
 	Column string
+	Not    bool
+}
+
+// LikeOp: column [NOT] LIKE 'pattern'. Pattern is the raw string literal —
+// wildcards (%, _) and the backslash escape are interpreted at evaluation
+// time so each executor (sqlcsv in-process, spsql OData) can apply them
+// however suits its target.
+type LikeOp struct {
+	Column  string
+	Pattern string
+	Not     bool
+}
+
+// InOp: column [NOT] IN (v1, v2, ...). Values is non-empty; the parser
+// rejects "IN ()".
+type InOp struct {
+	Column string
+	Values []Value
+	Not    bool
+}
+
+// BetweenOp: column [NOT] BETWEEN low AND high. Bounds are inclusive,
+// matching standard SQL.
+type BetweenOp struct {
+	Column string
+	Low    Value
+	High   Value
 	Not    bool
 }
 
@@ -197,6 +227,9 @@ const (
 	TokDesc
 	TokLimit
 	TokOffset
+	TokLike
+	TokIn
+	TokBetween
 )
 
 type Token struct {
@@ -227,6 +260,9 @@ var keywords = map[string]TokenType{
 	"DESC":     TokDesc,
 	"LIMIT":    TokLimit,
 	"OFFSET":   TokOffset,
+	"LIKE":     TokLike,
+	"IN":       TokIn,
+	"BETWEEN":  TokBetween,
 }
 
 type lexer struct {
@@ -810,6 +846,22 @@ func (p *parser) parseAtom() (Predicate, error) {
 		}
 		return &NullTest{Column: col, Not: not}, nil
 	}
+	// Postfix NOT applies only to LIKE / IN / BETWEEN. If we accept NOT here
+	// but don't see one of those next, the parser produces an error pointing
+	// at the NOT.
+	notTok, hasNot := p.accept(TokNot)
+	if _, ok := p.accept(TokLike); ok {
+		return p.parseLikeBody(col, hasNot)
+	}
+	if _, ok := p.accept(TokIn); ok {
+		return p.parseInBody(col, hasNot)
+	}
+	if _, ok := p.accept(TokBetween); ok {
+		return p.parseBetweenBody(col, hasNot)
+	}
+	if hasNot {
+		return nil, parseErrorAt(notTok.Pos, fmt.Sprintf("expected LIKE, IN, or BETWEEN after NOT, got %s", describeToken(p.peek())))
+	}
 	opTok := p.peek()
 	var op string
 	switch opTok.Type {
@@ -826,7 +878,7 @@ func (p *parser) parseAtom() (Predicate, error) {
 	case TokGe:
 		op = ">="
 	default:
-		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("expected comparison operator or IS, got %s", describeToken(opTok)))
+		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("expected comparison operator, IS, LIKE, IN, or BETWEEN, got %s", describeToken(opTok)))
 	}
 	p.advance()
 	v, err := p.parseValue()
@@ -837,6 +889,64 @@ func (p *parser) parseAtom() (Predicate, error) {
 		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("cannot use '%s' with NULL; use IS NULL or IS NOT NULL instead", op))
 	}
 	return &Comparison{Column: col, Op: op, Value: v}, nil
+}
+
+func (p *parser) parseLikeBody(col string, not bool) (Predicate, error) {
+	t := p.peek()
+	if t.Type != TokString {
+		return nil, parseErrorAt(t.Pos, fmt.Sprintf("LIKE requires a string pattern, got %s", describeToken(t)))
+	}
+	p.advance()
+	return &LikeOp{Column: col, Pattern: t.Lit, Not: not}, nil
+}
+
+func (p *parser) parseInBody(col string, not bool) (Predicate, error) {
+	if _, err := p.expect(TokLParen, "'(' after IN"); err != nil {
+		return nil, err
+	}
+	if p.peek().Type == TokRParen {
+		return nil, parseErrorAt(p.peek().Pos, "IN requires at least one value")
+	}
+	first, err := p.parseValue()
+	if err != nil {
+		return nil, err
+	}
+	values := []Value{first}
+	for {
+		if _, ok := p.accept(TokComma); !ok {
+			break
+		}
+		v, err := p.parseValue()
+		if err != nil {
+			return nil, err
+		}
+		values = append(values, v)
+	}
+	if _, err := p.expect(TokRParen, "')'"); err != nil {
+		return nil, err
+	}
+	return &InOp{Column: col, Values: values, Not: not}, nil
+}
+
+func (p *parser) parseBetweenBody(col string, not bool) (Predicate, error) {
+	low, err := p.parseValue()
+	if err != nil {
+		return nil, err
+	}
+	if low.Kind == ValNull {
+		return nil, parseErrorAt(p.peek().Pos, "BETWEEN bounds cannot be NULL")
+	}
+	if _, err := p.expect(TokAnd, "AND between BETWEEN bounds"); err != nil {
+		return nil, err
+	}
+	high, err := p.parseValue()
+	if err != nil {
+		return nil, err
+	}
+	if high.Kind == ValNull {
+		return nil, parseErrorAt(p.peek().Pos, "BETWEEN bounds cannot be NULL")
+	}
+	return &BetweenOp{Column: col, Low: low, High: high, Not: not}, nil
 }
 
 func describeToken(t Token) string {
