@@ -19,6 +19,7 @@ func iptr(n int) *int                       { return &n }
 func asc(c string) OrderKey                 { return OrderKey{Column: c} }
 func desc(c string) OrderKey                { return OrderKey{Column: c, Desc: true} }
 func like(c, p string, n bool) *LikeOp      { return &LikeOp{Column: c, Pattern: p, Not: n} }
+func ilike(c, p string, n bool) *LikeOp     { return &LikeOp{Column: c, Pattern: p, Not: n, Insensitive: true} }
 func in(c string, vs []Value, n bool) *InOp { return &InOp{Column: c, Values: vs, Not: n} }
 func between(c string, lo, hi Value, n bool) *BetweenOp {
 	return &BetweenOp{Column: c, Low: lo, High: hi, Not: n}
@@ -188,6 +189,50 @@ func TestParse(t *testing.T) {
 			name:    "like rejects bare number",
 			input:   "SELECT * WHERE Title LIKE 42",
 			wantErr: "string pattern",
+		},
+
+		// ILIKE
+		{
+			name:  "ilike prefix",
+			input: "SELECT * WHERE Title ILIKE 'Foo%'",
+			want:  &SelectStmt{Star: true, Where: ilike("Title", "Foo%", false)},
+		},
+		{
+			name:  "not ilike",
+			input: "SELECT * WHERE Title NOT ILIKE '%draft%'",
+			want:  &SelectStmt{Star: true, Where: ilike("Title", "%draft%", true)},
+		},
+
+		// SQL comments
+		{
+			name:  "line comment at end",
+			input: "SELECT * WHERE Status = 'Open' -- old draft",
+			want:  &SelectStmt{Star: true, Where: cmp("Status", "=", vstr("Open"))},
+		},
+		{
+			name:  "line comment in middle",
+			input: "SELECT *\n-- the filter follows\nWHERE Status = 'Open'",
+			want:  &SelectStmt{Star: true, Where: cmp("Status", "=", vstr("Open"))},
+		},
+		{
+			name:  "block comment in middle",
+			input: "SELECT * /* historical: was status_v2 */ WHERE Status = 'Open'",
+			want:  &SelectStmt{Star: true, Where: cmp("Status", "=", vstr("Open"))},
+		},
+		{
+			name:  "block comment spanning lines",
+			input: "SELECT *\n/*\n  this query exists\n  because of ticket #42\n*/\nWHERE Status = 'Open'",
+			want:  &SelectStmt{Star: true, Where: cmp("Status", "=", vstr("Open"))},
+		},
+		{
+			name:  "comment before SELECT",
+			input: "-- some preamble\nSELECT * WHERE Status = 'Open'",
+			want:  &SelectStmt{Star: true, Where: cmp("Status", "=", vstr("Open"))},
+		},
+		{
+			name:  "string literal containing comment-like text",
+			input: "SELECT * WHERE Title = '-- not a comment'",
+			want:  &SelectStmt{Star: true, Where: cmp("Title", "=", vstr("-- not a comment"))},
 		},
 
 		// IN

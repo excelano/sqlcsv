@@ -91,14 +91,17 @@ type NullTest struct {
 	Not    bool
 }
 
-// LikeOp: column [NOT] LIKE 'pattern'. Pattern is the raw string literal —
-// wildcards (%, _) and the backslash escape are interpreted at evaluation
-// time so each executor (sqlcsv in-process, spsql OData) can apply them
-// however suits its target.
+// LikeOp: column [NOT] LIKE 'pattern' or column [NOT] ILIKE 'pattern'.
+// Pattern is the raw string literal — wildcards (%, _) and the backslash
+// escape are interpreted at evaluation time so each executor (sqlcsv
+// in-process, spsql OData) can apply them however suits its target.
+// Insensitive=true marks the ILIKE variant: pattern and column value are
+// compared case-insensitively.
 type LikeOp struct {
-	Column  string
-	Pattern string
-	Not     bool
+	Column      string
+	Pattern     string
+	Not         bool
+	Insensitive bool
 }
 
 // InOp: column [NOT] IN (v1, v2, ...). Values is non-empty; the parser
@@ -228,6 +231,7 @@ const (
 	TokLimit
 	TokOffset
 	TokLike
+	TokILike
 	TokIn
 	TokBetween
 )
@@ -261,6 +265,7 @@ var keywords = map[string]TokenType{
 	"LIMIT":    TokLimit,
 	"OFFSET":   TokOffset,
 	"LIKE":     TokLike,
+	"ILIKE":    TokILike,
 	"IN":       TokIn,
 	"BETWEEN":  TokBetween,
 }
@@ -270,11 +275,37 @@ type lexer struct {
 	pos int
 }
 
+// skipWhitespace also discards SQL comments. Line comments start with `--`
+// and run to end-of-line (or end-of-input); block comments start with `/*`
+// and run to `*/`. Block comments do not nest, matching ANSI SQL (Postgres
+// permits nesting but the standard doesn't). An unterminated block comment
+// returns an error via the lexer's error channel — but we have none, so the
+// surrounding tokenizer will see the run as whitespace and continue, which
+// will surface as a parse error at the next real token; that's acceptable
+// for a SQL REPL where the user can just retype.
 func (l *lexer) skipWhitespace() {
 	for l.pos < len(l.src) {
 		c := l.src[l.pos]
 		if c == ' ' || c == '\t' || c == '\n' || c == '\r' {
 			l.pos++
+			continue
+		}
+		if c == '-' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '-' {
+			l.pos += 2
+			for l.pos < len(l.src) && l.src[l.pos] != '\n' {
+				l.pos++
+			}
+			continue
+		}
+		if c == '/' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '*' {
+			l.pos += 2
+			for l.pos < len(l.src) {
+				if l.src[l.pos] == '*' && l.pos+1 < len(l.src) && l.src[l.pos+1] == '/' {
+					l.pos += 2
+					break
+				}
+				l.pos++
+			}
 			continue
 		}
 		break
@@ -851,7 +882,10 @@ func (p *parser) parseAtom() (Predicate, error) {
 	// at the NOT.
 	notTok, hasNot := p.accept(TokNot)
 	if _, ok := p.accept(TokLike); ok {
-		return p.parseLikeBody(col, hasNot)
+		return p.parseLikeBody(col, hasNot, false)
+	}
+	if _, ok := p.accept(TokILike); ok {
+		return p.parseLikeBody(col, hasNot, true)
 	}
 	if _, ok := p.accept(TokIn); ok {
 		return p.parseInBody(col, hasNot)
@@ -860,7 +894,7 @@ func (p *parser) parseAtom() (Predicate, error) {
 		return p.parseBetweenBody(col, hasNot)
 	}
 	if hasNot {
-		return nil, parseErrorAt(notTok.Pos, fmt.Sprintf("expected LIKE, IN, or BETWEEN after NOT, got %s", describeToken(p.peek())))
+		return nil, parseErrorAt(notTok.Pos, fmt.Sprintf("expected LIKE, ILIKE, IN, or BETWEEN after NOT, got %s", describeToken(p.peek())))
 	}
 	opTok := p.peek()
 	var op string
@@ -878,7 +912,7 @@ func (p *parser) parseAtom() (Predicate, error) {
 	case TokGe:
 		op = ">="
 	default:
-		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("expected comparison operator, IS, LIKE, IN, or BETWEEN, got %s", describeToken(opTok)))
+		return nil, parseErrorAt(opTok.Pos, fmt.Sprintf("expected comparison operator, IS, LIKE, ILIKE, IN, or BETWEEN, got %s", describeToken(opTok)))
 	}
 	p.advance()
 	v, err := p.parseValue()
@@ -891,13 +925,17 @@ func (p *parser) parseAtom() (Predicate, error) {
 	return &Comparison{Column: col, Op: op, Value: v}, nil
 }
 
-func (p *parser) parseLikeBody(col string, not bool) (Predicate, error) {
+func (p *parser) parseLikeBody(col string, not, insensitive bool) (Predicate, error) {
 	t := p.peek()
 	if t.Type != TokString {
-		return nil, parseErrorAt(t.Pos, fmt.Sprintf("LIKE requires a string pattern, got %s", describeToken(t)))
+		name := "LIKE"
+		if insensitive {
+			name = "ILIKE"
+		}
+		return nil, parseErrorAt(t.Pos, fmt.Sprintf("%s requires a string pattern, got %s", name, describeToken(t)))
 	}
 	p.advance()
-	return &LikeOp{Column: col, Pattern: t.Lit, Not: not}, nil
+	return &LikeOp{Column: col, Pattern: t.Lit, Not: not, Insensitive: insensitive}, nil
 }
 
 func (p *parser) parseInBody(col string, not bool) (Predicate, error) {

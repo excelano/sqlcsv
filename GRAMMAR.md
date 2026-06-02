@@ -61,7 +61,7 @@ atom          := comparison | null_test | like_test | in_test | between_test | "
 comparison    := column op value
 op            := "=" | "!=" | "<" | ">" | "<=" | ">="
 null_test     := column "IS" "NOT"? "NULL"
-like_test     := column "NOT"? "LIKE" string
+like_test     := column "NOT"? ( "LIKE" | "ILIKE" ) string
 in_test       := column "NOT"? "IN" "(" value ( "," value )* ")"
 between_test  := column "NOT"? "BETWEEN" value "AND" value
 ```
@@ -97,11 +97,22 @@ Empty CSV cells are treated as `NULL` for the purposes of `IS NULL` and `IS NOT 
 
 `LIKE` matches a string column against a pattern. `%` matches zero or more characters; `_` matches exactly one. A backslash escapes the next character (`\%` matches a literal `%`, `\_` a literal `_`). LIKE only works on string columns; running it against a numeric, date, or boolean column is a clear error rather than a silent coercion. `NOT LIKE` negates the match. A NULL cell makes the result UNKNOWN, which excludes the row, matching standard SQL.
 
+`ILIKE` is the case-insensitive form of `LIKE` (a Postgres extension). Both the pattern and the column value are folded to lowercase before matching, so `Title ILIKE 'open%'` matches `Open`, `OPEN`, and `open` alike. `NOT ILIKE` negates.
+
 `IN` tests for set membership: `col IN (v1, v2, v3)`. The value list must be non-empty and must contain only literals — sub-queries are not supported. Values are coerced to the column's type, so `Priority IN (1, 2, 3)` works against an integer column and `Status IN ('Open', 'Done')` against a string column. `NOT IN` negates the match. NULL on the column side excludes the row; NULL inside the list is a parse error.
 
 `BETWEEN` is inclusive on both bounds: `col BETWEEN low AND high` is equivalent to `col >= low AND col <= high`. Bounds must be literal values, not NULL, and are coerced to the column's type. `NOT BETWEEN` negates the match. NULL on the column side excludes the row.
 
 Statements are terminated by end of input. A trailing semicolon is accepted but not required.
+
+## Comments
+
+Two comment styles are accepted anywhere whitespace is legal:
+
+- **Line comments** start with `--` and run to the next newline (or end of input). Useful for annotating a query when pasted from a saved file.
+- **Block comments** are delimited by `/*` and `*/` and may span multiple lines. Block comments do not nest — the first `*/` after `/*` closes the comment, matching ANSI SQL. (Postgres allows nesting; that's a deliberate divergence we have not adopted.)
+
+Comments are ignored as if they were whitespace, so they can appear between any two tokens. Inside a string literal, `--` and `/* */` are plain characters with no special meaning.
 
 ## REPL pre-processing
 
@@ -130,6 +141,7 @@ SELECT Title WHERE (Status = 'Open' OR Status = 'In Review') AND NOT Archived = 
 SELECT Title WHERE DueDate IS NULL
 SELECT Title WHERE DueDate IS NOT NULL AND Modified < '2024-01-01'
 SELECT Title WHERE Title LIKE 'Fix%'
+SELECT Title WHERE Title ILIKE 'fix%'
 SELECT Title WHERE Title NOT LIKE '%draft%'
 SELECT Title WHERE Status IN ('Open', 'In Progress')
 SELECT Title WHERE Priority NOT IN (4, 5)
@@ -158,4 +170,4 @@ The v1 grammar is now feature-complete relative to the original v1.x scope.
 
 Planned for v2, requiring extra work: aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, `HAVING`, and computed assignments like `SET col = col + 1`.
 
-No current plan: subqueries, scalar functions (`LOWER`, `UPPER`, `YEAR`, etc.), `AS` aliases, `UNION` / `INTERSECT` / `EXCEPT`, common table expressions, and SQL comments. None are technically impossible, but each adds parser complexity for a use case that has not surfaced yet.
+No current plan: subqueries, scalar functions (`LOWER`, `UPPER`, `YEAR`, etc.), `AS` aliases, `UNION` / `INTERSECT` / `EXCEPT`, and common table expressions. None are technically impossible, but each adds parser complexity for a use case that has not surfaced yet.

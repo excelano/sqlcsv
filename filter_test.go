@@ -205,6 +205,31 @@ func TestMatchesLike(t *testing.T) {
 	}
 }
 
+func TestMatchesILike(t *testing.T) {
+	// Fixture titles: Alpha, Beta, Gamma, Delta.
+	tbl := fixtureTable()
+	ctx := NewEvalContext(tbl)
+	cases := []struct {
+		name    string
+		pred    Predicate
+		wantIDs []int64
+	}{
+		{"ilike prefix lowercase pattern matches mixed case", ilike("Title", "alpha", false), []int64{1}},
+		{"ilike prefix uppercase pattern matches mixed case", ilike("Title", "ALPHA%", false), []int64{1}},
+		{"ilike contains case insensitive", ilike("Title", "%ET%", false), []int64{2}},
+		{"not ilike", ilike("Title", "alpha", true), []int64{2, 3, 4}},
+		{"ilike no match", ilike("Title", "Zzz%", false), []int64{}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			ids := matchingIDs(t, tbl, ctx, tc.pred)
+			if !equalIDs(ids, tc.wantIDs) {
+				t.Fatalf("got %v, want %v", ids, tc.wantIDs)
+			}
+		})
+	}
+}
+
 func TestMatchesLikeRejectsNonString(t *testing.T) {
 	tbl := fixtureTable()
 	ctx := NewEvalContext(tbl)

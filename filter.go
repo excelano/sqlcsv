@@ -1,6 +1,9 @@
 package main
 
-import "fmt"
+import (
+	"fmt"
+	"strings"
+)
 
 // triVal encodes SQL three-valued logic. WHERE keeps only rows whose
 // predicate evaluates to triTrue; triUnknown (NULL-tainted comparisons)
@@ -126,10 +129,11 @@ func evalPredicate(p Predicate, row Row, ctx *EvalContext) (triVal, error) {
 	return triFalse, fmt.Errorf("internal: unhandled predicate type %T", p)
 }
 
-// evalLike applies a SQL LIKE pattern. Only string-typed columns are
-// supported (matches Postgres semantics; numeric/date LIKE would force a
-// string cast that hides type bugs more than it helps). NULL cells produce
-// UNKNOWN, matching standard SQL three-valued logic.
+// evalLike applies a SQL LIKE (case-sensitive) or ILIKE (case-insensitive)
+// pattern. Only string-typed columns are supported (matches Postgres
+// semantics; numeric/date LIKE would force a string cast that hides type
+// bugs more than it helps). NULL cells produce UNKNOWN, matching standard
+// SQL three-valued logic.
 func evalLike(n *LikeOp, row Row, ctx *EvalContext) (triVal, error) {
 	idx, ok := ctx.ColIdx[n.Column]
 	if !ok {
@@ -137,13 +141,22 @@ func evalLike(n *LikeOp, row Row, ctx *EvalContext) (triVal, error) {
 	}
 	info := ctx.Schema[n.Column]
 	if info.Type != TypeString {
-		return triFalse, fmt.Errorf("WHERE %s LIKE: column has type %s; LIKE only works on string columns", n.Column, info.Type)
+		op := "LIKE"
+		if n.Insensitive {
+			op = "ILIKE"
+		}
+		return triFalse, fmt.Errorf("WHERE %s %s: column has type %s; %s only works on string columns", n.Column, op, info.Type, op)
 	}
 	cell := row[idx]
 	if cell.Null {
 		return triUnknown, nil
 	}
-	match := likeMatch(n.Pattern, cell.Str)
+	pattern, target := n.Pattern, cell.Str
+	if n.Insensitive {
+		pattern = strings.ToLower(pattern)
+		target = strings.ToLower(target)
+	}
+	match := likeMatch(pattern, target)
 	if n.Not {
 		match = !match
 	}
