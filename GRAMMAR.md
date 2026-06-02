@@ -1,10 +1,8 @@
-# sqlcsv Grammar (v2.0-alpha)
+# sqlcsv Grammar (v2.0)
 
 The formal grammar for the SQL subset that `sqlcsv` accepts in its REPL. Anything outside this grammar produces a clear parse error pointing at the unsupported construct, rather than silently misinterpreting input.
 
 This grammar is identical to [spsql's grammar](https://github.com/excelano/spsql/blob/main/GRAMMAR.md). The two tools share parser code so that one mental model covers both.
-
-**v2.0-alpha note.** This release ships the v2 grammar in full but the executor still runs the v1 feature set. Arithmetic projections, aggregates, `GROUP BY`, `HAVING`, `AS` aliases, and computed `SET` assignments all parse cleanly, then fail at execution with a clear "lands in v2.0" message. The intent is to publish the grammar surface for review while the executor work continues. Queries that fit the v1 shape execute exactly as they did in v1.x.
 
 ## Notation
 
@@ -54,7 +52,7 @@ A bare column name (`SELECT Title`) projects that column unchanged. An arithmeti
 
 `SELECT DISTINCT` collapses rows that have identical values across the projected columns. Deduplication runs after `WHERE` and `GROUP BY`, on the typed values. Two `NULL`s in the same projected column are considered equal for deduplication, matching standard SQL.
 
-`ORDER BY` sorts rows by one or more keys. Each key is a column name with an optional `ASC` (default) or `DESC` direction. Expression keys (`ORDER BY price * qty`) and alias references (`ORDER BY n` referring to an `AS n` projection) are not part of v2.0 and are planned for v2.1.
+`ORDER BY` sorts rows by one or more keys. Each key is a column name with an optional `ASC` (default) or `DESC` direction. In aggregated queries (`GROUP BY` or implicit aggregation), `ORDER BY` keys must name a column in the `SELECT` list — either an explicit `AS` alias or the rendered source text of an unaliased projection. Non-aggregated queries may sort by any source column, whether or not it appears in the projection. Expression keys (`ORDER BY price * qty`) are planned for a later release.
 
 `LIMIT n` takes at most the first n rows of the result, and `OFFSET m` skips the first m rows. Both require a non-negative integer literal; floats and negatives are parse errors.
 
@@ -152,20 +150,18 @@ A trailing `!` is stripped and recorded as a "skip prompt" signal for write stat
 
 ## Examples
 
-Valid statements under the v2.0-alpha grammar. Those marked **(executes in v1.x mode)** also run today; those marked **(v2.0 executor)** parse cleanly but error at execution until v2.0 ships.
+Valid statements under the v2.0 grammar.
 
 ```sql
--- v1 shape (executes in v1.x mode)
 SELECT Title, Status WHERE Priority > 2
 SELECT DISTINCT Status WHERE Archived = FALSE
 SELECT Title WHERE DueDate IS NULL ORDER BY Modified DESC LIMIT 10
 UPDATE SET Status = 'Done' WHERE ID = 42
 
--- v2 grammar (v2.0 executor)
 SELECT Title AS t, Priority AS p
 SELECT price * qty AS line_total
 SELECT COUNT(*) AS n
-SELECT Status, COUNT(*) AS n GROUP BY Status
+SELECT Status, COUNT(*) AS n GROUP BY Status ORDER BY n DESC
 SELECT Status, AVG(price) GROUP BY Status HAVING AVG(price) > 50
 UPDATE SET counter = counter + 1 WHERE id = 7
 SELECT * WHERE price * qty > 100
@@ -175,6 +171,6 @@ SELECT * WHERE price * qty > 100
 
 Permanently out of scope: `JOIN` of any form. sqlcsv operates on a single file per session by design. To combine data across files, run a SELECT against each, redirect to a new CSV, and load it.
 
-Planned but not in v2.0: `ORDER BY` with expressions or alias references, `GROUP BY` with expressions, `COUNT(DISTINCT col)`, and scalar functions (`LOWER`, `UPPER`, `YEAR`, etc.).
+Planned but not in v2.0: `ORDER BY` with expressions, `GROUP BY` with expressions, `COUNT(DISTINCT col)`, and scalar functions (`LOWER`, `UPPER`, `YEAR`, etc.).
 
 No current plan: subqueries, `UNION` / `INTERSECT` / `EXCEPT`, and common table expressions. None are technically impossible, but each adds parser complexity for a use case that has not surfaced yet.

@@ -52,9 +52,6 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 	if err := ValidatePredicate(sel.Where, e.Table.Schema); err != nil {
 		return err
 	}
-	if err := e.validateOrderBy(sel.OrderBy); err != nil {
-		return err
-	}
 	ctx := NewEvalContext(e.Table)
 
 	matched := make([]int, 0, len(e.Table.Rows))
@@ -78,14 +75,25 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 			}
 		}
 	}
-	// ORDER BY over aggregated output needs to sort the output rows, not the
-	// matched source rows; slice 6 rewires sortByKeys for that. Until then,
-	// pair them only with the row-stream path.
-	if aggregated && len(sel.OrderBy) > 0 {
-		return fmt.Errorf("ORDER BY with GROUP BY or aggregates lands in v2.0")
-	}
 	if sel.Having != nil && !aggregated {
 		return fmt.Errorf("HAVING requires GROUP BY or aggregate projections")
+	}
+
+	// Resolve ORDER BY against the right symbol space. Non-aggregated queries
+	// sort source rows before projection (existing path, schema-validated);
+	// aggregated queries sort projected output rows by SELECT-list label.
+	var orderPlan []orderEntry
+	if len(sel.OrderBy) > 0 {
+		if aggregated {
+			orderPlan, err = resolveOrderByOutput(sel.OrderBy, plan)
+			if err != nil {
+				return err
+			}
+		} else {
+			if err := e.validateOrderBy(sel.OrderBy); err != nil {
+				return err
+			}
+		}
 	}
 
 	var projected [][]Cell
@@ -139,6 +147,13 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 			out = append(out, pr)
 		}
 		projected = out
+	}
+
+	// Aggregated ORDER BY runs after DISTINCT and before OFFSET/LIMIT, the
+	// standard SQL pipeline position. Non-aggregated sort happened before
+	// projection above.
+	if aggregated && len(orderPlan) > 0 {
+		sortOutputRows(projected, orderPlan)
 	}
 
 	projected = applyOffsetLimitRows(projected, sel.Offset, sel.Limit)
@@ -489,6 +504,8 @@ func projectedKey(pr []Cell, plan []projEntry) string {
 
 // validateOrderBy rejects sort keys that don't name a column in the table.
 // Catching this here avoids a runtime nil deref deep in the comparator.
+// Used by non-aggregated queries; aggregated paths resolve against the
+// projection plan via resolveOrderByOutput instead.
 func (e *Executor) validateOrderBy(keys []OrderKey) error {
 	for _, k := range keys {
 		if _, ok := e.Table.Schema[k.Column]; !ok {
@@ -496,6 +513,57 @@ func (e *Executor) validateOrderBy(keys []OrderKey) error {
 		}
 	}
 	return nil
+}
+
+// orderEntry is one resolved ORDER BY key, bound to a projected-row column
+// index. Produced once at plan time and reused per comparison during the
+// stable sort.
+type orderEntry struct {
+	Col  int
+	Type ColumnType
+	Desc bool
+}
+
+// resolveOrderByOutput maps each ORDER BY key to a projection-plan slot by
+// label match. Aggregated queries can't reach source columns after
+// projection; every sort key must therefore live in the SELECT list, either
+// under an explicit alias or under the rendered source text of an
+// unaliased projection.
+func resolveOrderByOutput(keys []OrderKey, plan []projEntry) ([]orderEntry, error) {
+	out := make([]orderEntry, len(keys))
+	for i, k := range keys {
+		idx := -1
+		for j, p := range plan {
+			if p.Label == k.Column {
+				idx = j
+				break
+			}
+		}
+		if idx < 0 {
+			return nil, fmt.Errorf("unknown column %q in ORDER BY; aggregated queries must sort on a column in the SELECT list", k.Column)
+		}
+		out[i] = orderEntry{Col: idx, Type: plan[idx].Type, Desc: k.Desc}
+	}
+	return out, nil
+}
+
+// sortOutputRows stable-sorts projected output rows by the resolved
+// ORDER BY plan. NULLs sort high per the same compareForOrder rules the
+// source-row sort uses, so the two paths report a consistent ordering when
+// either is reachable.
+func sortOutputRows(rows [][]Cell, order []orderEntry) {
+	sort.SliceStable(rows, func(i, j int) bool {
+		for _, k := range order {
+			cmp := compareForOrder(rows[i][k.Col], rows[j][k.Col], k.Type)
+			if k.Desc {
+				cmp = -cmp
+			}
+			if cmp != 0 {
+				return cmp < 0
+			}
+		}
+		return false
+	})
 }
 
 // sortByKeys does an in-place stable sort of row indices by the ORDER BY keys.

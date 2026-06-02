@@ -633,21 +633,92 @@ func TestExecSelectGroupByStarRejected(t *testing.T) {
 	}
 }
 
-func TestExecSelectGroupByOrderByDefers(t *testing.T) {
-	// ORDER BY combined with GROUP BY/aggregates is slice 6 territory; until
-	// then the executor must surface a clear "lands in v2.0" message instead
-	// of silently sorting the wrong axis.
-	e, _, _ := newExec(t)
+func TestExecSelectGroupByOrderByGroupColumn(t *testing.T) {
+	// Group insertion order is Open then Done; ORDER BY Status ASC must
+	// flip that to Done then Open. Sorts post-projection on the output
+	// label, not the source rows.
+	e, out, _ := newExec(t)
 	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status ORDER BY Status")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tCOUNT(*)\nDone\t1\nOpen\t3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByOrderByAlias(t *testing.T) {
+	// Same as the aggregate-sort test but referenced through an AS alias.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) AS n GROUP BY Status ORDER BY n DESC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tn\nOpen\t3\nDone\t1"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectGroupByOrderByUnknownLabelRejected(t *testing.T) {
+	// Aggregated queries cannot reach source columns through ORDER BY; a
+	// non-projected column must be rejected with a clear hint.
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) GROUP BY Status ORDER BY Priority")
 	if err != nil {
 		t.Fatal(err)
 	}
 	err = e.Execute(stmt, false)
 	if err == nil {
-		t.Fatal("expected GROUP BY + ORDER BY defer")
+		t.Fatal("expected unknown-label rejection")
 	}
-	if !strings.Contains(err.Error(), "ORDER BY") {
-		t.Errorf("error should mention ORDER BY: %v", err)
+	if !strings.Contains(err.Error(), "Priority") || !strings.Contains(err.Error(), "SELECT list") {
+		t.Errorf("error should mention column and SELECT list: %v", err)
+	}
+}
+
+func TestExecSelectGroupByOrderByLimit(t *testing.T) {
+	// ORDER BY then LIMIT 1 → top group only. Verifies the slice 6 sort
+	// runs before applyOffsetLimitRows.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT Status, COUNT(*) AS n GROUP BY Status ORDER BY n DESC LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "Status\tn\nOpen\t3"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
+	}
+}
+
+func TestExecSelectImplicitAggregateOrderBy(t *testing.T) {
+	// Single-row implicit aggregation — ORDER BY parses, resolves, and
+	// trivially sorts the one-row result. No panic, just one row out.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT COUNT(*) AS n ORDER BY n")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	got := strings.TrimRight(out.String(), "\n")
+	want := "n\n4"
+	if got != want {
+		t.Errorf("got %q, want %q", got, want)
 	}
 }
 
