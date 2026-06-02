@@ -13,7 +13,13 @@ This document uses a compact EBNF-style notation. `:=` defines a rule. `|` separ
 ```ebnf
 statement     := select_stmt | update_stmt | delete_stmt | insert_stmt
 
-select_stmt   := "SELECT" "DISTINCT"? projection ( "WHERE" predicate )?
+select_stmt   := "SELECT" "DISTINCT"? projection
+                 ( "WHERE" predicate )?
+                 ( "ORDER" "BY" sort_key ( "," sort_key )* )?
+                 ( "LIMIT" integer )?
+                 ( "OFFSET" integer )?
+
+sort_key      := column ( "ASC" | "DESC" )?
 
 update_stmt   := "UPDATE" "SET" assignment ( "," assignment )*
                  ( "WHERE" predicate )?
@@ -36,6 +42,12 @@ assignment    := column "=" value
 `SELECT *` returns every column in the file. A column list returns only those columns in the order given.
 
 `SELECT DISTINCT` collapses rows that have identical values across the projected columns. Deduplication runs after `WHERE`, on the typed values (so an integer `1` and the string `"1"` from different columns are not treated as equal). Two `NULL`s in the same projected column are considered equal for the purpose of deduplication, matching standard SQL.
+
+`ORDER BY` sorts rows by one or more keys. Each key is a column name with an optional `ASC` (default) or `DESC` direction. Sort comparisons use the column's inferred type — integers compare as numbers, dates as dates, strings byte-wise. The sort is stable: rows tied on every key keep their original relative order. `NULL` values sort to the high end — last in `ASC`, first in `DESC` — following the Postgres convention.
+
+`LIMIT n` takes at most the first n rows of the result, and `OFFSET m` skips the first m rows. Both require a non-negative integer literal; floats and negatives are parse errors. `OFFSET` can stand alone without `LIMIT`. `LIMIT 0` is legal and returns no rows.
+
+Clauses must appear in the order: `WHERE`, `ORDER BY`, `LIMIT`, `OFFSET`. Execution order is `WHERE` → `DISTINCT` → `ORDER BY` → `OFFSET` → `LIMIT`, which is the standard SQL pipeline.
 
 ## Predicates
 
@@ -99,6 +111,10 @@ SELECT *
 SELECT Title, Status, "Created Date"
 SELECT DISTINCT Status
 SELECT DISTINCT Status, Priority WHERE Archived = FALSE
+SELECT Title WHERE Status = 'Open' ORDER BY Modified DESC
+SELECT Title WHERE Status = 'Open' ORDER BY Priority DESC, Modified ASC
+SELECT Title ORDER BY Modified DESC LIMIT 10
+SELECT Title ORDER BY ID LIMIT 25 OFFSET 50
 SELECT Title WHERE Status = 'Open'
 SELECT Title WHERE Status = 'Open' AND Priority > 2
 SELECT Title WHERE (Status = 'Open' OR Status = 'In Review') AND NOT Archived = TRUE
@@ -123,7 +139,7 @@ The grammar deliberately excludes most of SQL. Each excluded construct produces 
 
 Permanently out of scope: `JOIN` of any form. sqlcsv operates on a single file per session by design. To combine data across files, run a SELECT against each, redirect to a new CSV, and load it.
 
-Planned for v1.1: `LIKE` for substring matching, `IN` for set membership, `BETWEEN` for range tests, `ORDER BY`, `LIMIT`, and `OFFSET`.
+Planned for v1.1: `LIKE` for substring matching, `IN` for set membership, and `BETWEEN` for range tests.
 
 Planned for v2, requiring extra work: aggregates (`COUNT`, `SUM`, `AVG`, `MIN`, `MAX`), `GROUP BY`, `HAVING`, and computed assignments like `SET col = col + 1`.
 

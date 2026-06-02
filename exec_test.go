@@ -167,6 +167,185 @@ func TestExecSelectDistinctNullsCollapse(t *testing.T) {
 	}
 }
 
+func TestExecSelectOrderByAsc(t *testing.T) {
+	// Fixture priorities (in row order): 3, 1, 5, NULL.
+	// ASC, NULLs LAST: 1, 3, 5, NULL → IDs 2, 1, 3, 4.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY Priority ASC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "2", "1", "3", "4"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), len(want), out.String())
+	}
+	for i, w := range want {
+		if lines[i] != w {
+			t.Errorf("line %d: got %q, want %q", i, lines[i], w)
+		}
+	}
+}
+
+func TestExecSelectOrderByDesc(t *testing.T) {
+	// DESC, NULLs FIRST: NULL, 5, 3, 1 → IDs 4, 3, 1, 2.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY Priority DESC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "4", "3", "1", "2"}
+	for i, w := range want {
+		if lines[i] != w {
+			t.Errorf("line %d: got %q, want %q", i, lines[i], w)
+		}
+	}
+}
+
+func TestExecSelectOrderByMultiKey(t *testing.T) {
+	// ORDER BY Status ASC, Priority DESC.
+	// Statuses: Open, Done, Open, Open. Priorities: 3, 1, 5, NULL.
+	// ASC by Status: Done first (ID 2), then three Opens.
+	// Within Opens, DESC by Priority with NULLs FIRST in DESC:
+	//   NULL (ID 4), 5 (ID 3), 3 (ID 1).
+	// Expected ID order: 2, 4, 3, 1.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY Status ASC, Priority DESC")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "2", "4", "3", "1"}
+	for i, w := range want {
+		if lines[i] != w {
+			t.Errorf("line %d: got %q, want %q", i, lines[i], w)
+		}
+	}
+}
+
+func TestExecSelectOrderByUnknownColumn(t *testing.T) {
+	e, _, _ := newExec(t)
+	stmt, err := Parse("SELECT * ORDER BY Nope")
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = e.Execute(stmt, false)
+	if err == nil {
+		t.Fatal("expected error")
+	}
+	if !strings.Contains(err.Error(), "Nope") || !strings.Contains(err.Error(), "ORDER BY") {
+		t.Fatalf("error should name column and clause: %v", err)
+	}
+}
+
+func TestExecSelectLimit(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY ID LIMIT 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "1", "2"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), len(want), out.String())
+	}
+}
+
+func TestExecSelectOffset(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY ID OFFSET 2")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "3", "4"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), len(want), out.String())
+	}
+}
+
+func TestExecSelectLimitOffset(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID ORDER BY ID LIMIT 1 OFFSET 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	want := []string{"ID", "2"}
+	if len(lines) != len(want) {
+		t.Fatalf("got %d lines, want %d: %q", len(lines), len(want), out.String())
+	}
+}
+
+func TestExecSelectOffsetPastEnd(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID OFFSET 100")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	// Header only.
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || lines[0] != "ID" {
+		t.Fatalf("expected header only, got %q", out.String())
+	}
+}
+
+func TestExecSelectLimitZero(t *testing.T) {
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT ID LIMIT 0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 1 || lines[0] != "ID" {
+		t.Fatalf("expected header only, got %q", out.String())
+	}
+}
+
+func TestExecSelectDistinctOrderLimit(t *testing.T) {
+	// Combine all the new clauses with DISTINCT.
+	// Statuses: Open, Done, Open, Open. DISTINCT → {Open, Done}.
+	// ORDER BY Status ASC → Done, Open.
+	// LIMIT 1 → Done.
+	e, out, _ := newExec(t)
+	stmt, err := Parse("SELECT DISTINCT Status ORDER BY Status ASC LIMIT 1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Execute(stmt, false); err != nil {
+		t.Fatalf("Execute: %v", err)
+	}
+	lines := strings.Split(strings.TrimSpace(out.String()), "\n")
+	if len(lines) != 2 || lines[1] != "Done" {
+		t.Fatalf("want header + Done, got %q", out.String())
+	}
+}
+
 func TestExecSelectUnknownColumn(t *testing.T) {
 	e, _, _ := newExec(t)
 	stmt, err := Parse("SELECT Nope")

@@ -2,6 +2,7 @@ package main
 
 import (
 	"fmt"
+	"strconv"
 	"strings"
 )
 
@@ -15,12 +16,24 @@ func (*DeleteStmt) stmt() {}
 func (*InsertStmt) stmt() {}
 
 // SelectStmt represents a SELECT. Star is true for `SELECT *`; in that case
-// Columns is nil. Distinct is true for `SELECT DISTINCT ...`.
+// Columns is nil. Distinct is true for `SELECT DISTINCT ...`. OrderBy is the
+// list of sort keys in user order. Limit and Offset are pointers so that
+// "unset" is distinguishable from explicit 0.
 type SelectStmt struct {
 	Distinct bool
 	Star     bool
 	Columns  []string
 	Where    Predicate
+	OrderBy  []OrderKey
+	Limit    *int
+	Offset   *int
+}
+
+// OrderKey is one entry in an ORDER BY list: a column and a direction.
+// Desc=false is ASC.
+type OrderKey struct {
+	Column string
+	Desc   bool
 }
 
 type UpdateStmt struct {
@@ -178,6 +191,12 @@ const (
 	TokNull
 	TokTrue
 	TokFalse
+	TokOrder
+	TokBy
+	TokAsc
+	TokDesc
+	TokLimit
+	TokOffset
 )
 
 type Token struct {
@@ -202,6 +221,12 @@ var keywords = map[string]TokenType{
 	"NULL":     TokNull,
 	"TRUE":     TokTrue,
 	"FALSE":    TokFalse,
+	"ORDER":    TokOrder,
+	"BY":       TokBy,
+	"ASC":      TokAsc,
+	"DESC":     TokDesc,
+	"LIMIT":    TokLimit,
+	"OFFSET":   TokOffset,
 }
 
 type lexer struct {
@@ -469,10 +494,90 @@ func (p *parser) parseSelectBody() (Stmt, error) {
 		}
 		sel.Where = pred
 	}
+	if _, ok := p.accept(TokOrder); ok {
+		keys, err := p.parseOrderBy()
+		if err != nil {
+			return nil, err
+		}
+		sel.OrderBy = keys
+	}
+	if _, ok := p.accept(TokLimit); ok {
+		n, err := p.parseNonNegativeInt("LIMIT")
+		if err != nil {
+			return nil, err
+		}
+		sel.Limit = &n
+	}
+	if _, ok := p.accept(TokOffset); ok {
+		n, err := p.parseNonNegativeInt("OFFSET")
+		if err != nil {
+			return nil, err
+		}
+		sel.Offset = &n
+	}
 	if err := p.expectEOF(); err != nil {
 		return nil, err
 	}
 	return sel, nil
+}
+
+func (p *parser) parseOrderBy() ([]OrderKey, error) {
+	if _, err := p.expect(TokBy, "BY after ORDER"); err != nil {
+		return nil, err
+	}
+	first, err := p.parseOrderKey()
+	if err != nil {
+		return nil, err
+	}
+	keys := []OrderKey{first}
+	for {
+		if _, ok := p.accept(TokComma); !ok {
+			break
+		}
+		k, err := p.parseOrderKey()
+		if err != nil {
+			return nil, err
+		}
+		keys = append(keys, k)
+	}
+	return keys, nil
+}
+
+func (p *parser) parseOrderKey() (OrderKey, error) {
+	col, err := p.parseColumn()
+	if err != nil {
+		return OrderKey{}, err
+	}
+	k := OrderKey{Column: col}
+	if _, ok := p.accept(TokAsc); ok {
+		k.Desc = false
+	} else if _, ok := p.accept(TokDesc); ok {
+		k.Desc = true
+	}
+	return k, nil
+}
+
+// parseNonNegativeInt accepts a bare positive number token after LIMIT / OFFSET.
+// Floats and negatives are rejected, since both would be nonsensical for the
+// caller. The clause name appears in the error so the user can see which one
+// objected.
+func (p *parser) parseNonNegativeInt(clause string) (int, error) {
+	t := p.peek()
+	if t.Type != TokNumber {
+		return 0, parseErrorAt(t.Pos, fmt.Sprintf("expected non-negative integer after %s, got %s", clause, describeToken(t)))
+	}
+	if strings.ContainsRune(t.Lit, '.') {
+		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s requires an integer, got %s", clause, t.Lit))
+	}
+	if strings.HasPrefix(t.Lit, "-") {
+		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s requires a non-negative integer, got %s", clause, t.Lit))
+	}
+	n, err := strconv.Atoi(t.Lit)
+	if err != nil {
+		return 0, parseErrorAt(t.Pos, fmt.Sprintf("%s: invalid number %q", clause, t.Lit))
+	}
+	p.advance()
+	return n, nil
 }
 
 func (p *parser) parseUpdateBody() (Stmt, error) {

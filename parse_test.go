@@ -15,6 +15,9 @@ func isnull(c string, not bool) *NullTest    { return &NullTest{Column: c, Not: 
 func and(l, r Predicate) *BinaryOp          { return &BinaryOp{Op: "AND", L: l, R: r} }
 func or(l, r Predicate) *BinaryOp           { return &BinaryOp{Op: "OR", L: l, R: r} }
 func not(p Predicate) *NotOp                { return &NotOp{Inner: p} }
+func iptr(n int) *int                       { return &n }
+func asc(c string) OrderKey                 { return OrderKey{Column: c} }
+func desc(c string) OrderKey                { return OrderKey{Column: c, Desc: true} }
 
 func TestParse(t *testing.T) {
 	tests := []struct {
@@ -84,6 +87,80 @@ func TestParse(t *testing.T) {
 				Columns:  []string{"Status"},
 				Where:    cmp("Priority", ">", vnum("2")),
 			},
+		},
+
+		// ORDER BY / LIMIT / OFFSET
+		{
+			name:  "order by single column default asc",
+			input: "SELECT * ORDER BY Title",
+			want:  &SelectStmt{Star: true, OrderBy: []OrderKey{asc("Title")}},
+		},
+		{
+			name:  "order by explicit asc",
+			input: "SELECT * ORDER BY Title ASC",
+			want:  &SelectStmt{Star: true, OrderBy: []OrderKey{asc("Title")}},
+		},
+		{
+			name:  "order by desc",
+			input: "SELECT * ORDER BY Priority DESC",
+			want:  &SelectStmt{Star: true, OrderBy: []OrderKey{desc("Priority")}},
+		},
+		{
+			name:  "order by multiple keys mixed direction",
+			input: "SELECT * ORDER BY Status ASC, Priority DESC",
+			want:  &SelectStmt{Star: true, OrderBy: []OrderKey{asc("Status"), desc("Priority")}},
+		},
+		{
+			name:  "order by lowercase keywords",
+			input: "select * order by title desc",
+			want:  &SelectStmt{Star: true, OrderBy: []OrderKey{desc("title")}},
+		},
+		{
+			name:  "limit only",
+			input: "SELECT * LIMIT 10",
+			want:  &SelectStmt{Star: true, Limit: iptr(10)},
+		},
+		{
+			name:  "offset only",
+			input: "SELECT * OFFSET 5",
+			want:  &SelectStmt{Star: true, Offset: iptr(5)},
+		},
+		{
+			name:  "limit and offset",
+			input: "SELECT * LIMIT 10 OFFSET 5",
+			want:  &SelectStmt{Star: true, Limit: iptr(10), Offset: iptr(5)},
+		},
+		{
+			name:  "all clauses combined",
+			input: "SELECT DISTINCT Status WHERE Priority > 2 ORDER BY Status DESC LIMIT 3 OFFSET 1",
+			want: &SelectStmt{
+				Distinct: true,
+				Columns:  []string{"Status"},
+				Where:    cmp("Priority", ">", vnum("2")),
+				OrderBy:  []OrderKey{desc("Status")},
+				Limit:    iptr(3),
+				Offset:   iptr(1),
+			},
+		},
+		{
+			name:    "order missing by",
+			input:   "SELECT * ORDER Title",
+			wantErr: "BY",
+		},
+		{
+			name:    "limit rejects negative",
+			input:   "SELECT * LIMIT -1",
+			wantErr: "non-negative",
+		},
+		{
+			name:    "limit rejects float",
+			input:   "SELECT * LIMIT 1.5",
+			wantErr: "integer",
+		},
+		{
+			name:    "offset rejects float",
+			input:   "SELECT * OFFSET 0.5",
+			wantErr: "integer",
 		},
 
 		// SELECT with WHERE: comparison operators

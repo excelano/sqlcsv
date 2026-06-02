@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 )
 
@@ -51,35 +52,120 @@ func (e *Executor) executeSelect(sel *SelectStmt) error {
 	if err := ValidatePredicate(sel.Where, e.Table.Schema); err != nil {
 		return err
 	}
-	ctx := NewEvalContext(e.Table)
-	rows := make([]map[string]any, 0, len(e.Table.Rows))
-	var seen map[string]struct{}
-	if sel.Distinct {
-		seen = make(map[string]struct{}, len(e.Table.Rows))
+	if err := e.validateOrderBy(sel.OrderBy); err != nil {
+		return err
 	}
-	for _, row := range e.Table.Rows {
+	ctx := NewEvalContext(e.Table)
+
+	matched := make([]int, 0, len(e.Table.Rows))
+	for i, row := range e.Table.Rows {
 		ok, err := Matches(sel.Where, row, ctx)
 		if err != nil {
 			return err
 		}
-		if !ok {
-			continue
+		if ok {
+			matched = append(matched, i)
 		}
-		if sel.Distinct {
-			key := distinctKey(row, cols, e.Table, ctx)
+	}
+
+	if sel.Distinct {
+		seen := make(map[string]struct{}, len(matched))
+		out := matched[:0]
+		for _, idx := range matched {
+			key := distinctKey(e.Table.Rows[idx], cols, e.Table, ctx)
 			if _, dup := seen[key]; dup {
 				continue
 			}
 			seen[key] = struct{}{}
+			out = append(out, idx)
 		}
+		matched = out
+	}
+
+	if len(sel.OrderBy) > 0 {
+		e.sortByKeys(matched, sel.OrderBy, ctx)
+	}
+
+	matched = applyOffsetLimit(matched, sel.Offset, sel.Limit)
+
+	rows := make([]map[string]any, 0, len(matched))
+	for _, idx := range matched {
+		row := e.Table.Rows[idx]
 		m := make(map[string]any, len(cols))
 		for _, c := range cols {
-			idx := ctx.ColIdx[c]
-			m[c] = row[idx].AsAny(e.Table.Schema[c].Type)
+			ci := ctx.ColIdx[c]
+			m[c] = row[ci].AsAny(e.Table.Schema[c].Type)
 		}
 		rows = append(rows, m)
 	}
 	return Render(e.Out, Result{Columns: cols, Rows: rows}, e.Format)
+}
+
+// validateOrderBy rejects sort keys that don't name a column in the table.
+// Catching this here avoids a runtime nil deref deep in the comparator.
+func (e *Executor) validateOrderBy(keys []OrderKey) error {
+	for _, k := range keys {
+		if _, ok := e.Table.Schema[k.Column]; !ok {
+			return fmt.Errorf("unknown column %q in ORDER BY", k.Column)
+		}
+	}
+	return nil
+}
+
+// sortByKeys does an in-place stable sort of row indices by the ORDER BY keys.
+// Stability matters: ties on key N preserve the original (input) order, which
+// gives users a predictable result. NULLs sort to the high end: last in ASC,
+// first in DESC — the Postgres convention.
+func (e *Executor) sortByKeys(indices []int, keys []OrderKey, ctx *EvalContext) {
+	sort.SliceStable(indices, func(i, j int) bool {
+		ra, rb := e.Table.Rows[indices[i]], e.Table.Rows[indices[j]]
+		for _, k := range keys {
+			ci := ctx.ColIdx[k.Column]
+			t := e.Table.Schema[k.Column].Type
+			cmp := compareForOrder(ra[ci], rb[ci], t)
+			if k.Desc {
+				cmp = -cmp
+			}
+			if cmp != 0 {
+				return cmp < 0
+			}
+		}
+		return false
+	})
+}
+
+// compareForOrder is a NULLs-go-high variant of Compare: a NULL cell is treated
+// as the maximum value, so ASC puts NULLs at the bottom of the result and DESC
+// puts them at the top. This matches Postgres's default; SQLite goes the other
+// way, but Postgres semantics are the more common reference point.
+func compareForOrder(a, b Cell, t ColumnType) int {
+	if a.Null && b.Null {
+		return 0
+	}
+	if a.Null {
+		return 1
+	}
+	if b.Null {
+		return -1
+	}
+	// Delegate to the existing typed comparator for the non-NULL case.
+	return Compare(a, b, t)
+}
+
+// applyOffsetLimit returns the slice of indices after OFFSET m skips m rows
+// and LIMIT n keeps the first n. Either may be nil (no clause). OFFSET past
+// the end yields an empty slice; LIMIT 0 also yields an empty slice.
+func applyOffsetLimit(indices []int, offset, limit *int) []int {
+	if offset != nil {
+		if *offset >= len(indices) {
+			return indices[:0]
+		}
+		indices = indices[*offset:]
+	}
+	if limit != nil && *limit < len(indices) {
+		indices = indices[:*limit]
+	}
+	return indices
 }
 
 // distinctKey builds a per-row dedupe key from the projected columns. Typed
